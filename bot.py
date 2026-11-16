@@ -452,36 +452,38 @@ class TeamBot(commands.Bot):
     async def on_ready(self) -> None:
         LOG.info("로그인 완료: %s (서버 %d곳)", self.user, len(self.guilds))
 
-    async def on_app_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ) -> None:
-        """슬래시 명령어에서 난 오류를 한국어 안내로 바꿔 조용히 알려 줍니다."""
-        original: BaseException = error
-        if isinstance(error, app_commands.CommandInvokeError):
-            original = error.original
-
-        if isinstance(original, TeamBotError):
-            message = str(original)
-        elif isinstance(error, app_commands.TransformerError):
-            message = "채널을 찾지 못했어요. 목록에서 음성 채널을 다시 골라 주세요."
-        elif isinstance(error, app_commands.MissingPermissions):
-            message = "이 명령을 쓰려면 **'멤버 이동'** 권한이 필요해요."
-        elif isinstance(error, app_commands.BotMissingPermissions):
-            message = "봇에게 필요한 권한이 없어요. 봇 역할에 **'멤버 이동'** 권한을 켜 주세요."
-        else:
-            LOG.exception("슬래시 명령어 오류: %s", error, exc_info=original)
-            message = "처리 중 예상치 못한 문제가 생겼어요. 잠시 후 다시 시도해 주세요."
-
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-        except discord.HTTPException:
-            LOG.warning("오류 안내 메시지를 보내지 못했어요")
-
 
 bot = TeamBot()
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    """슬래시 명령어에서 난 오류를 한국어 안내로 바꿔 조용히 알려 줍니다."""
+    original: BaseException = error
+    if isinstance(error, app_commands.CommandInvokeError):
+        original = error.original
+
+    if isinstance(original, TeamBotError):
+        message = str(original)
+    elif isinstance(error, app_commands.TransformerError):
+        message = "채널을 찾지 못했어요. 목록에서 음성 채널을 다시 골라 주세요."
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "이 명령을 쓰려면 **'멤버 이동'** 권한이 필요해요."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        message = "봇에게 필요한 권한이 없어요. 봇 역할에 **'멤버 이동'** 권한을 켜 주세요."
+    else:
+        LOG.exception("슬래시 명령어 오류: %s", error, exc_info=original)
+        message = "처리 중 예상치 못한 문제가 생겼어요. 잠시 후 다시 시도해 주세요."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        LOG.warning("오류 안내 메시지를 보내지 못했어요")
 
 
 # ---------------------------------------------------------------------------
