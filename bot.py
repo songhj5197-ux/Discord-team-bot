@@ -15,9 +15,10 @@
     /기록채널  채널                     → 점수 백업용 텍스트 채널 지정
 
 결과 메시지의 버튼
-    🔀 다시 섞기          같은 인원을 다시 섞어 이동 (새 판으로 리셋)
-    🏆 1팀 승리         1팀 승리로 점수 정산 (한 판에 한 번)
-    🏆 2팀 승리         2팀 승리로 점수 정산 (한 판에 한 번)
+    🔀 다시 섞기          같은 인원을 다시 섞어 이동 (새 판으로 리셋, 라운드 스코어 0:0)
+    🏆 1팀 승리         1팀 승리로 그 라운드를 정산 (누를 때마다 라운드가 쌓임)
+    🏆 2팀 승리         2팀 승리로 그 라운드를 정산 (누를 때마다 라운드가 쌓임)
+    ↩️ 방금 정산 취소     마지막으로 정산한 라운드 1회분을 되돌림
     📢 대기방으로 모으기   두 팀 채널의 인원을 처음 대기방으로 복귀
 
 점수
@@ -74,7 +75,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else None
 
-BUTTON_TIMEOUT = 60 * 30          # 결과 버튼을 누를 수 있는 시간(초)
+BUTTON_TIMEOUT = 60 * 60 * 3      # 결과 버튼을 누를 수 있는 시간(초) — 4맵 내전도 넉넉하게
 MOVE_REASON = "팀 나누기 봇: 팀 이동"
 PLACEHOLDER_TOKEN = "여기에_봇_토큰_입력"
 
@@ -446,6 +447,7 @@ def build_split_embed(
     failed: int = 0,
     settlement: Optional["Settlement"] = None,
     winner_number: int = 0,
+    rounds: Sequence["RoundRecord"] = (),
 ) -> discord.Embed:
     embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
     avg1 = team_average(team1)
@@ -463,8 +465,9 @@ def build_split_embed(
 
     if settlement is not None:
         winner_label = f"{winner_number}팀"
+        round_label = f" · {len(rounds)}라운드" if rounds else ""
         embed.add_field(
-            name=f"🏆 {winner_label} 승리 · 정산 완료 (+{settlement.gain} / -{settlement.loss})",
+            name=f"🏆 {winner_label} 승리{round_label} · 정산 완료 (+{settlement.gain} / -{settlement.loss})",
             value=(
                 f"__승리 팀 (+{settlement.gain})__\n{_settlement_lines(settlement.winners)}\n"
                 f"__패배 팀 (-{settlement.loss})__\n{_settlement_lines(settlement.losers)}"
@@ -472,10 +475,25 @@ def build_split_embed(
             inline=False,
         )
 
+    if rounds:
+        wins1 = sum(1 for entry in rounds if entry.winner_number == 1)
+        wins2 = len(rounds) - wins1
+        last = rounds[-1]
+        embed.add_field(
+            name=f"📊 현재 스코어 · {len(rounds)}라운드",
+            value=(
+                f"**1팀 {wins1}승** vs **2팀 {wins2}승**\n"
+                f"최근 라운드 변동: 승리 +{last.settlement.gain} / 패배 -{last.settlement.loss}"
+            ),
+            inline=False,
+        )
+
     footer = f"{MODE_LABELS.get(mode, mode)} 배정 · 총 {len(team1) + len(team2)}명 · 평균차 {abs(avg1 - avg2):.0f}점"
     if failed:
         footer += f" · 이동 실패 {failed}명"
-    if settlement is not None:
+    if rounds:
+        footer += f" · {len(rounds)}라운드 정산 (1팀 {sum(1 for entry in rounds if entry.winner_number == 1)}승 vs 2팀 {sum(1 for entry in rounds if entry.winner_number == 2)}승)"
+    elif settlement is not None:
         footer += " · 정산 완료"
     embed.set_footer(text=footer)
     return embed
@@ -546,6 +564,55 @@ class Settlement:
     loss: int
     winners: list[ScoreChange] = field(default_factory=list)
     losers: list[ScoreChange] = field(default_factory=list)
+
+
+@dataclass
+class RoundRecord:
+    """한 판에서 정산한 라운드 하나의 기록 (취소할 때 이 기록 그대로 되돌립니다)."""
+
+    round_no: int
+    winner_number: int
+    settlement: Settlement
+
+
+class RoundLog:
+    """한 판의 라운드별 정산 기록.
+
+    같은 팀 조합 그대로 라운드를 계속 쌓을 수 있고, 마지막 라운드 하나만
+    되돌릴 수 있습니다. 🔀 다시 섞기 로 새 판을 시작하면 0:0 으로 비워집니다.
+    """
+
+    def __init__(self) -> None:
+        self.rounds: list[RoundRecord] = []
+
+    def __len__(self) -> int:
+        return len(self.rounds)
+
+    @property
+    def count(self) -> int:
+        return len(self.rounds)
+
+    @property
+    def latest(self) -> Optional[RoundRecord]:
+        return self.rounds[-1] if self.rounds else None
+
+    def record(self, winner_number: int, settlement: Settlement) -> RoundRecord:
+        entry = RoundRecord(len(self.rounds) + 1, winner_number, settlement)
+        self.rounds.append(entry)
+        return entry
+
+    def pop(self) -> Optional[RoundRecord]:
+        return self.rounds.pop() if self.rounds else None
+
+    def clear(self) -> None:
+        self.rounds.clear()
+
+    def wins(self, team_number: int) -> int:
+        return sum(1 for entry in self.rounds if entry.winner_number == team_number)
+
+    def score_line(self) -> str:
+        """'1팀 2승 vs 2팀 1승' 형태의 현재 라운드 스코어."""
+        return f"1팀 {self.wins(1)}승 vs 2팀 {self.wins(2)}승"
 
 
 class ScoreStore:
@@ -725,6 +792,44 @@ class ScoreStore:
 
             return Settlement(gain=gain, loss=loss, winners=winners, losers=losers)
 
+    def revert_settlement(
+        self,
+        guild_id: int,
+        winners: Sequence[ScoreChange],
+        losers: Sequence[ScoreChange],
+    ) -> tuple[list[ScoreChange], list[ScoreChange]]:
+        """마지막 라운드 정산을 정확히 되돌립니다 (점수 역적용 + 승/패 -1).
+
+        정산 때 기록한 변동량(delta)을 그대로 빼므로, 0점 하한에 걸려 실제로는
+        오르지 못한 점수도 원래 자리로 돌아갑니다.
+        """
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+
+            def rollback(changes: Sequence[ScoreChange], counter: str) -> list[ScoreChange]:
+                restored: list[ScoreChange] = []
+                for change in changes:
+                    record = guild["members"].get(str(change.user_id))
+                    if record is None:
+                        continue
+                    before = int(record["score"])
+                    after = max(MIN_SCORE, before - change.delta)
+                    record["score"] = after
+                    record[counter] = max(0, int(record.get(counter, 0)) - 1)
+                    restored.append(
+                        ScoreChange(
+                            change.user_id,
+                            record.get("name", ""),
+                            before,
+                            after,
+                            tier_label(before),
+                            tier_label(after),
+                        )
+                    )
+                return restored
+
+            return rollback(winners, "wins"), rollback(losers, "losses")
+
     def ranking(self, guild_id: int) -> list[dict[str, Any]]:
         with self._lock:
             guild = self._guild(guild_id)
@@ -890,22 +995,6 @@ async def read_backup_channel(
     for content in used_contents:
         message_ids.extend(content_to_ids.get(content, []))
     return payload, message_ids
-
-
-class SettlementGuard:
-    """한 판의 승리 정산이 한 번만 일어나도록 잠그는 도우미."""
-
-    def __init__(self) -> None:
-        self.settled = False
-
-    def try_begin(self) -> bool:
-        if self.settled:
-            return False
-        self.settled = True
-        return True
-
-    def reset(self) -> None:
-        self.settled = False
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1362,11 @@ def _button_custom_ids(view: "SplitResultView") -> dict[str, discord.ui.Button]:
 
 
 class SplitResultView(discord.ui.View):
-    """팀 나누기 결과에 붙는 버튼 4개."""
+    """팀 나누기 결과에 붙는 버튼들.
+
+    1줄: 🔀 다시 섞기 · 🏆 1팀 승리 · 🏆 2팀 승리 · 📢 대기방으로 모으기
+    2줄: ↩️ 방금 정산 취소
+    """
 
     def __init__(
         self,
@@ -1299,10 +1392,10 @@ class SplitResultView(discord.ui.View):
         self.mode = mode
         self.team1: list[Player] = list(team1)
         self.team2: list[Player] = list(team2)
-        self.guard = SettlementGuard()
+        self.rounds = RoundLog()
         self.message: Optional[discord.Message] = None
         self._lock = asyncio.Lock()
-        self._sync_win_buttons()
+        self._sync_buttons()
 
     # -- 권한 ---------------------------------------------------------------
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1318,10 +1411,27 @@ class SplitResultView(discord.ui.View):
         return False
 
     # -- 도우미 -------------------------------------------------------------
-    def _sync_win_buttons(self) -> None:
+    def _sync_buttons(self) -> None:
+        """승리 버튼은 항상 열어 두고(라운드마다 계속 누름), 취소 버튼만
+        정산된 라운드가 있을 때 활성화합니다."""
         for custom_id, button in _button_custom_ids(self).items():
-            if custom_id in {"team_bot:win1", "team_bot:win2"}:
-                button.disabled = self.guard.settled
+            if custom_id == "team_bot:undo":
+                button.disabled = self.rounds.count == 0
+
+    def _refresh_players(self) -> None:
+        """정산·취소 뒤 임베드에 보이는 점수를 저장소의 현재 점수로 맞춥니다."""
+        def refresh(team: Sequence[Player]) -> list[Player]:
+            return [
+                Player(
+                    member_id=player.member_id,
+                    name=player.name,
+                    score=self.bot.store.score_of(self.guild.id, player.member_id),
+                )
+                for player in team
+            ]
+
+        self.team1 = refresh(self.team1)
+        self.team2 = refresh(self.team2)
 
     def _resolve(self, channel_id: int, label: str) -> discord.VoiceChannel:
         channel = self.guild.get_channel(channel_id)
@@ -1350,10 +1460,12 @@ class SplitResultView(discord.ui.View):
         return list(found.values())
 
     def _build_embed(self, **kwargs: Any) -> discord.Embed:
+        self._refresh_players()
         return build_split_embed(
             self.team1,
             self.team2,
             mode=self.mode,
+            rounds=self.rounds.rounds,
             **kwargs,
         )
 
@@ -1405,12 +1517,15 @@ class SplitResultView(discord.ui.View):
                 failed = failed1 + failed2
 
                 self.team1, self.team2 = team1, team2
-                self.guard.reset()
-                self._sync_win_buttons()
+                self.rounds.clear()          # 새 판 → 라운드 스코어 0:0 으로 초기화
+                self._sync_buttons()
 
                 embed = self._build_embed(
                     title="🔀 다시 섞은 결과",
-                    description=f"같은 인원을 **{MODE_LABELS.get(self.mode, self.mode)}** 방식으로 다시 나눠 이동시켰어요.",
+                    description=(
+                        f"같은 인원을 **{MODE_LABELS.get(self.mode, self.mode)}** 방식으로 다시 나눠 이동시켰어요.\n"
+                        "라운드 스코어는 **0 : 0** 으로 초기화됐어요."
+                    ),
                     failed=len(failed),
                 )
                 await interaction.edit_original_response(embed=embed, view=self)
@@ -1446,20 +1561,13 @@ class SplitResultView(discord.ui.View):
         await self._settle(interaction, winner_number=2)
 
     async def _settle(self, interaction: discord.Interaction, *, winner_number: int) -> None:
+        """누를 때마다 한 라운드씩 정산합니다 (팀·버튼 그대로 여러 라운드 가능)."""
         if self._lock.locked():
             await interaction.response.send_message("지금 처리 중이에요. 잠시만 기다려 주세요.", ephemeral=True)
             return
 
         async with self._lock:
-            if not self.guard.try_begin():
-                await interaction.response.send_message(
-                    "이미 승패가 정산된 판이에요. 새로 하려면 **🔀 다시 섞기** 를 눌러 주세요.",
-                    ephemeral=True,
-                )
-                return
-
             await interaction.response.defer()
-            applied = False
             try:
                 winners = self.team1 if winner_number == 1 else self.team2
                 losers = self.team2 if winner_number == 1 else self.team1
@@ -1473,30 +1581,28 @@ class SplitResultView(discord.ui.View):
                     [player.member_id for player in losers],
                     names=names,
                 )
-                applied = True
+                entry = self.rounds.record(winner_number, settlement)
                 self.bot.store.save()
                 await self.bot.sync_backup(self.guild.id)
 
-                self._sync_win_buttons()
+                self._sync_buttons()
                 embed = self._build_embed(
-                    title=f"🏆 {winner_number}팀 승리!",
+                    title=f"🏆 {winner_number}팀 승리! · {entry.round_no}라운드",
                     description=(
-                        f"**{winner_number}팀** 승리로 점수를 정산했어요. "
-                        f"(승리 +{settlement.gain} / 패배 -{settlement.loss})"
+                        f"**{winner_number}팀** 승리로 **{entry.round_no}라운드**를 정산했어요. "
+                        f"(승리 +{settlement.gain} / 패배 -{settlement.loss})\n"
+                        f"같은 팀 그대로 다음 라운드도 **🏆 버튼**으로 이어서 정산할 수 있어요. "
+                        f"잘못 눌렀다면 **↩️ 방금 정산 취소** 를 눌러 주세요."
                     ),
                     settlement=settlement,
                     winner_number=winner_number,
                 )
                 await interaction.edit_original_response(embed=embed, view=self)
             except TeamBotError as error:
-                if not applied:
-                    self.guard.reset()
                 await interaction.followup.send(str(error), ephemeral=True)
                 return
             except Exception:
                 LOG.exception("승리 정산 처리 중 오류")
-                if not applied:
-                    self.guard.reset()
                 await interaction.followup.send(
                     "점수를 정산하는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.", ephemeral=True
                 )
@@ -1558,6 +1664,62 @@ class SplitResultView(discord.ui.View):
                 f"⚠️ {len(failed)}명은 이동하지 못했어요.\n{_failure_lines(failed)}", ephemeral=True
             )
 
+    # -- 버튼: 방금 정산 취소 ------------------------------------------------
+    @discord.ui.button(
+        label="방금 정산 취소", emoji="↩️", style=discord.ButtonStyle.danger,
+        custom_id="team_bot:undo", row=1,
+    )
+    async def undo_settlement(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """마지막으로 정산한 라운드 1회분의 점수 변동과 승/패를 정확히 되돌립니다."""
+        if self._lock.locked():
+            await interaction.response.send_message("지금 처리 중이에요. 잠시만 기다려 주세요.", ephemeral=True)
+            return
+
+        async with self._lock:
+            entry = self.rounds.latest
+            if entry is None:
+                await interaction.response.send_message(
+                    "되돌릴 정산이 없어요. **🏆 1팀 승리 / 🏆 2팀 승리** 로 한 라운드를 먼저 정산해 주세요.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            try:
+                self.bot.store.revert_settlement(
+                    self.guild.id,
+                    entry.settlement.winners,
+                    entry.settlement.losers,
+                )
+                self.rounds.pop()
+                self.bot.store.save()
+                await self.bot.sync_backup(self.guild.id)
+
+                self._sync_buttons()
+                latest = self.rounds.latest
+                description = (
+                    f"**{entry.round_no}라운드 ({entry.winner_number}팀 승리)** 정산을 되돌렸어요. "
+                    "점수와 승/패가 한 라운드 전으로 돌아갔어요.\n"
+                    f"현재 스코어: **{self.rounds.score_line()}**"
+                )
+                kwargs: dict[str, Any] = {
+                    "title": "↩️ 방금 정산을 취소했어요",
+                    "description": description,
+                }
+                if latest is not None:
+                    kwargs["settlement"] = latest.settlement
+                    kwargs["winner_number"] = latest.winner_number
+                embed = self._build_embed(**kwargs)
+                await interaction.edit_original_response(embed=embed, view=self)
+            except TeamBotError as error:
+                await interaction.followup.send(str(error), ephemeral=True)
+                return
+            except Exception:
+                LOG.exception("방금 정산 취소 처리 중 오류")
+                await interaction.followup.send(
+                    "정산을 되돌리는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.", ephemeral=True
+                )
+                return
 
 # ---------------------------------------------------------------------------
 # /팀나누기

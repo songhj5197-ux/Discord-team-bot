@@ -162,6 +162,31 @@ class StoreTests(unittest.TestCase):
         self.store.settle(9, [2], [1])
         self.assertEqual(self.store.score_of(9, 1), 0)
 
+    def test_revert_settlement_restores_score_and_counts(self):
+        for user_id in (1, 2, 3, 4):
+            self.store.ensure_player(9, user_id, f"u{user_id}")
+        settlement = self.store.settle(9, [1, 2], [3, 4])
+        self.assertEqual(self.store.score_of(9, 1), 1025)
+
+        winners, losers = self.store.revert_settlement(9, settlement.winners, settlement.losers)
+
+        self.assertEqual([change.user_id for change in winners], [1, 2])
+        self.assertEqual([change.user_id for change in losers], [3, 4])
+        self.assertEqual(self.store.score_of(9, 1), 1000)
+        self.assertEqual(self.store.score_of(9, 3), 1000)
+        rows = {row["user_id"]: row for row in self.store.ranking(9)}
+        self.assertEqual((rows[1]["wins"], rows[1]["losses"]), (0, 0))
+        self.assertEqual((rows[3]["wins"], rows[3]["losses"]), (0, 0))
+
+    def test_revert_restores_clamped_loser_score(self):
+        self.store.ensure_player(9, 1, "이기는사람")
+        self.store.set_score(9, 2, 5, "0점직전")
+        settlement = self.store.settle(9, [1], [2])
+        self.assertEqual(self.store.score_of(9, 2), 0)          # 하한에 걸려 5점만 잃음
+        self.store.revert_settlement(9, settlement.winners, settlement.losers)
+        self.assertEqual(self.store.score_of(9, 2), 5)
+        self.assertEqual(self.store.score_of(9, 1), 1000)
+
     def test_reset_member_and_guild(self):
         self.store.set_score(9, 1, 1500, "a")
         self.store.set_score(9, 2, 1200, "b")
@@ -257,20 +282,52 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(store.restore_from_payload(9, {"guild": {"members": []}}), 0)
 
 
-class SettlementGuardTests(unittest.TestCase):
-    def test_only_first_click_settles(self):
-        guard = team_bot.SettlementGuard()
-        self.assertTrue(guard.try_begin())
-        self.assertFalse(guard.try_begin())      # 중복 클릭 차단
-        self.assertFalse(guard.try_begin())
-        self.assertTrue(guard.settled)
+class RoundLogTests(unittest.TestCase):
+    def _settlement(self, gain=25, loss=20):
+        return team_bot.Settlement(
+            gain=gain,
+            loss=loss,
+            winners=[team_bot.ScoreChange(1, "a", 1000, 1000 + gain, "🥇 골드", "🥇 골드")],
+            losers=[team_bot.ScoreChange(2, "b", 1000, 1000 - loss, "🥇 골드", "🥈 실버")],
+        )
 
-    def test_reshuffle_resets(self):
-        guard = team_bot.SettlementGuard()
-        self.assertTrue(guard.try_begin())
-        guard.reset()
-        self.assertFalse(guard.settled)
-        self.assertTrue(guard.try_begin())
+    def test_rounds_accumulate(self):
+        log = team_bot.RoundLog()
+        self.assertEqual(log.count, 0)
+        self.assertIsNone(log.latest)
+        self.assertEqual(log.score_line(), "1팀 0승 vs 2팀 0승")
+
+        first = log.record(1, self._settlement())
+        second = log.record(2, self._settlement(28, 17))
+        third = log.record(1, self._settlement())
+
+        self.assertEqual([first.round_no, second.round_no, third.round_no], [1, 2, 3])
+        self.assertEqual(log.count, 3)
+        self.assertEqual(log.wins(1), 2)
+        self.assertEqual(log.wins(2), 1)
+        self.assertEqual(log.score_line(), "1팀 2승 vs 2팀 1승")
+        self.assertIs(log.latest, third)
+
+    def test_pop_returns_last_round_only(self):
+        log = team_bot.RoundLog()
+        log.record(1, self._settlement())
+        log.record(2, self._settlement())
+
+        self.assertEqual(log.pop().winner_number, 2)
+        self.assertEqual(log.count, 1)
+        self.assertEqual(log.latest.winner_number, 1)
+        self.assertEqual(log.pop().round_no, 1)
+        self.assertIsNone(log.pop())
+        self.assertEqual(log.score_line(), "1팀 0승 vs 2팀 0승")
+
+    def test_clear_resets_score(self):
+        log = team_bot.RoundLog()
+        log.record(1, self._settlement())
+        log.record(1, self._settlement())
+        log.clear()
+        self.assertEqual(log.count, 0)
+        self.assertIsNone(log.latest)
+        self.assertEqual(log.score_line(), "1팀 0승 vs 2팀 0승")
 
 
 class EmbedTests(unittest.TestCase):
@@ -296,6 +353,32 @@ class EmbedTests(unittest.TestCase):
         self.assertIn("+25", embed.fields[2].value)
         self.assertIn("-20", embed.fields[2].value)
 
+    def test_round_score_field(self):
+        players = _players([1000, 1000, 1000, 1000])
+        team1, team2 = players[:2], players[2:]
+        rounds = [
+            team_bot.RoundRecord(1, 1, team_bot.Settlement(25, 20)),
+            team_bot.RoundRecord(2, 2, team_bot.Settlement(28, 17)),
+            team_bot.RoundRecord(3, 1, team_bot.Settlement(22, 23)),
+        ]
+        embed = team_bot.build_split_embed(
+            team1, team2, settlement=rounds[-1].settlement, winner_number=1, rounds=rounds
+        )
+        score_field = embed.fields[3]
+        self.assertIn("현재 스코어", score_field.name)
+        self.assertIn("3라운드", score_field.name)
+        self.assertIn("1팀 2승", score_field.value)
+        self.assertIn("2팀 1승", score_field.value)
+        self.assertIn("승리 +22 / 패배 -23", score_field.value)      # 이번(마지막) 라운드 변동
+        self.assertIn("3라운드", embed.fields[2].name)              # 정산 필드에도 라운드 표시
+        self.assertIn("3라운드 정산", embed.footer.text)
+
+    def test_no_rounds_means_no_score_field(self):
+        players = _players([1000, 1000, 1000, 1000])
+        embed = team_bot.build_split_embed(players[:2], players[2:])
+        self.assertEqual(len(embed.fields), 2)
+        self.assertNotIn("라운드", embed.footer.text)
+
     def test_ranking_embed(self):
         rows = [{"user_id": 1, "name": "a", "score": 1200, "wins": 3, "losses": 1}]
         embed = team_bot.build_ranking_embed("테스트 서버", rows, total=1)
@@ -304,9 +387,13 @@ class EmbedTests(unittest.TestCase):
 
 
 class _StubChannel:
-    def __init__(self, channel_id):
+    def __init__(self, channel_id, name=None):
         self.id = channel_id
-        self.name = f"channel-{channel_id}"
+        self.name = name or f"channel-{channel_id}"
+        self.members = []
+
+    def permissions_for(self, me):
+        return FakeVoicePermissions()
 
 
 class FakeResponse:
@@ -352,28 +439,82 @@ class FakeBot:
 
 
 class _StubGuild:
-    def __init__(self, guild_id):
+    def __init__(self, guild_id, channels=()):
         self.id = guild_id
+        self.channels = {channel.id: channel for channel in channels}
+        self.me = FakeMe()
+
+    def get_channel(self, channel_id):
+        return self.channels.get(channel_id)
+
+    def get_member(self, member_id):
+        return None
+
+
+class FakeVoicePermissions:
+    def __init__(self, move_members=True):
+        self.move_members = move_members
+
+
+class FakeMe:
+    def __init__(self):
+        self.guild_permissions = FakeVoicePermissions()
+
+
+class FakeVoiceState:
+    def __init__(self, channel):
+        self.channel = channel
+
+
+class FakeMember:
+    """음성 채널 사이를 옮겨 다니는 가짜 멤버."""
+
+    def __init__(self, member_id, name, channel):
+        self.id = member_id
+        self.display_name = name
+        self.bot = False
+        self.voice = FakeVoiceState(channel)
+        self.moved = []
+
+    async def move_to(self, channel, reason=None):
+        self.voice.channel.members.remove(self)
+        channel.members.append(self)
+        self.voice.channel = channel
+        self.moved.append(channel.id)
 
 
 def _view(store):
-    fake_guild = _StubGuild(7)
+    """음성 채널·멤버까지 흔들 수 있는 가짜 서버로 결과 화면을 만듭니다."""
+    lobby = _StubChannel(1, "대기방")
+    team1_channel = _StubChannel(2, "팀1방")
+    team2_channel = _StubChannel(3, "팀2방")
+    fake_guild = _StubGuild(7, (lobby, team1_channel, team2_channel))
+
     team1 = [team_bot.Player(101, "가", 1000), team_bot.Player(102, "나", 1000)]
     team2 = [team_bot.Player(201, "다", 1000), team_bot.Player(202, "라", 1000)]
-    for player in team1 + team2:
+    for player, channel in ((team1[0], team1_channel), (team1[1], team1_channel),
+                            (team2[0], team2_channel), (team2[1], team2_channel)):
         store.ensure_player(7, player.member_id, player.name)
+        channel.members.append(FakeMember(player.member_id, player.name, channel))
+
     view = team_bot.SplitResultView(
         bot_=FakeBot(store),
         author_id=1,
         guild=fake_guild,
-        lobby=_StubChannel(1),
-        team1_channel=_StubChannel(2),
-        team2_channel=_StubChannel(3),
+        lobby=lobby,
+        team1_channel=team1_channel,
+        team2_channel=team2_channel,
         mode=team_bot.MODE_BALANCE,
         team1=team1,
         team2=team2,
     )
+    # 진짜 discord.VoiceChannel 이 아니라 가짜 채널이라 isinstance 검사를 건너뜁니다.
+    view._resolve = lambda channel_id, label: fake_guild.get_channel(channel_id)
     return view
+
+
+def _buttons(view):
+    return {child.custom_id: child for child in view.children if child.custom_id}
 
 
 class ViewTests(unittest.TestCase):
@@ -384,49 +525,122 @@ class ViewTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_four_buttons_in_one_row(self):
+    def test_button_layout_and_undo_initially_disabled(self):
         view = _view(self.store)
-        custom_ids = [child.custom_id for child in view.children]
+        layout = [(child.custom_id, child.row) for child in view.children]
         self.assertEqual(
-            custom_ids,
-            ["team_bot:reshuffle", "team_bot:win1", "team_bot:win2", "team_bot:gather"],
+            layout,
+            [
+                ("team_bot:reshuffle", 0),
+                ("team_bot:win1", 0),
+                ("team_bot:win2", 0),
+                ("team_bot:gather", 0),
+                ("team_bot:undo", 1),
+            ],
         )
-        for child in view.children:
-            self.assertEqual(child.row, 0)
-            self.assertFalse(child.disabled)
+        buttons = _buttons(view)
+        self.assertEqual(buttons["team_bot:undo"].label, "방금 정산 취소")
+        self.assertTrue(buttons["team_bot:undo"].disabled, "정산 0회에는 취소 버튼이 꺼져 있어야 해요")
+        for custom_id in ("team_bot:reshuffle", "team_bot:win1", "team_bot:win2", "team_bot:gather"):
+            self.assertFalse(buttons[custom_id].disabled)
 
-    def test_settlement_applies_once(self):
+    def test_button_timeout_is_three_hours(self):
+        self.assertEqual(team_bot.BUTTON_TIMEOUT, 60 * 60 * 3)
+        self.assertEqual(_view(self.store).timeout, 60 * 60 * 3)
+
+    def test_four_rounds_accumulate_on_same_teams(self):
         view = _view(self.store)
-        first = FakeInteraction()
-        asyncio_run(view._settle(first, winner_number=1))
+        for winner_number in (1, 1, 2, 1):
+            interaction = FakeInteraction()
+            asyncio_run(view._settle(interaction, winner_number=winner_number))
+            self.assertTrue(interaction.response.deferred)
+            self.assertTrue(interaction.edits, "라운드마다 결과 임베드가 갱신돼야 해요")
 
-        self.assertEqual(self.store.score_of(7, 101), 1025)
-        self.assertEqual(self.store.score_of(7, 102), 1025)
-        self.assertEqual(self.store.score_of(7, 201), 980)
-        self.assertEqual(self.store.score_of(7, 202), 980)
-        self.assertEqual(view.bot.backups, 1)
-        self.assertIn("1팀 승리", first.edits[0]["embed"].title)
-        self.assertTrue(all(child.disabled for child in view.children if child.custom_id in {"team_bot:win1", "team_bot:win2"}))
+        self.assertEqual(view.rounds.count, 4)
+        self.assertEqual(view.rounds.score_line(), "1팀 3승 vs 2팀 1승")
+        self.assertEqual(view.bot.backups, 4, "라운드마다 기록 채널 백업이 갱신돼야 해요")
+        # 라운드마다 Elo 가 다시 계산돼 누적됩니다.
+        self.assertEqual(self.store.score_of(7, 101), 1054)
+        self.assertEqual(self.store.score_of(7, 201), 965)
+        rows = {row["user_id"]: row for row in self.store.ranking(7)}
+        self.assertEqual((rows[101]["wins"], rows[101]["losses"]), (3, 1))
+        self.assertEqual((rows[201]["wins"], rows[201]["losses"]), (1, 3))
 
-        second = FakeInteraction()
-        asyncio_run(view._settle(second, winner_number=2))
-        self.assertEqual(self.store.score_of(7, 101), 1025, "중복 클릭으로 점수가 두 번 바뀌었어요")
-        self.assertEqual(self.store.score_of(7, 202), 980)
-        self.assertEqual(self.store.score_of(7, 201), 980)
-        self.assertEqual(view.bot.backups, 1)
-        self.assertIn("이미 승패가 정산된 판", second.response.messages[0])
+        embed = interaction.edits[0]["embed"]
+        self.assertIn("4라운드", embed.title)
+        score_field = embed.fields[3]
+        self.assertIn("4라운드", score_field.name)
+        self.assertIn("1팀 3승", score_field.value)
+        self.assertIn("2팀 1승", score_field.value)
+        self.assertIn("승리 +22 / 패배 -23", score_field.value)
 
-    def test_reshuffle_resets_settlement(self):
+        buttons = _buttons(view)
+        self.assertFalse(buttons["team_bot:win1"].disabled, "연속 라운드를 위해 승리 버튼은 계속 열려 있어야 해요")
+        self.assertFalse(buttons["team_bot:win2"].disabled)
+        self.assertFalse(buttons["team_bot:undo"].disabled)
+
+    def test_undo_reverts_only_last_round(self):
+        view = _view(self.store)
+        asyncio_run(view._settle(FakeInteraction(), winner_number=1))
+        after_first = (self.store.score_of(7, 101), self.store.score_of(7, 201))
+        asyncio_run(view._settle(FakeInteraction(), winner_number=2))
+        self.assertNotEqual((self.store.score_of(7, 101), self.store.score_of(7, 201)), after_first)
+
+        interaction = FakeInteraction()
+        asyncio_run(view.undo_settlement.callback(interaction))
+
+        self.assertEqual((self.store.score_of(7, 101), self.store.score_of(7, 201)), after_first)
+        self.assertEqual(self.store.score_of(7, 102), after_first[0])
+        self.assertEqual(self.store.score_of(7, 202), after_first[1])
+        self.assertEqual(view.rounds.count, 1)
+        self.assertEqual(view.rounds.score_line(), "1팀 1승 vs 2팀 0승")
+        self.assertEqual(view.bot.backups, 3, "취소 뒤 기록 채널 백업도 갱신돼야 해요")
+        rows = {row["user_id"]: row for row in self.store.ranking(7)}
+        self.assertEqual((rows[101]["wins"], rows[101]["losses"]), (1, 0))
+        self.assertEqual((rows[201]["wins"], rows[201]["losses"]), (0, 1))
+
+        embed = interaction.edits[0]["embed"]
+        self.assertIn("취소", embed.title)
+        self.assertIn("2라운드", embed.description)
+        self.assertIn("1팀 1승 vs 2팀 0승", embed.description)
+        self.assertIn("1라운드", embed.fields[3].name)
+
+    def test_undo_twice_returns_to_start(self):
         view = _view(self.store)
         asyncio_run(view._settle(FakeInteraction(), winner_number=2))
-        self.assertTrue(view.guard.settled)
-        view.guard.reset()
-        view._sync_win_buttons()
-        self.assertFalse(any(child.disabled for child in view.children))
-        third = FakeInteraction()
-        asyncio_run(view._settle(third, winner_number=1))
-        # 980점 팀이 1025점 팀을 이겼으니 업셋 가산(+28)이 붙어요
-        self.assertEqual(self.store.score_of(7, 101), 1008)
+        asyncio_run(view.undo_settlement.callback(FakeInteraction()))
+        self.assertEqual(self.store.score_of(7, 101), 1000)
+        self.assertEqual(self.store.score_of(7, 201), 1000)
+        self.assertEqual(view.rounds.count, 0)
+        self.assertTrue(_buttons(view)["team_bot:undo"].disabled)
+
+        empty = FakeInteraction()
+        asyncio_run(view.undo_settlement.callback(empty))
+        self.assertIn("되돌릴 정산이 없어요", empty.response.messages[0])
+        self.assertEqual(self.store.score_of(7, 101), 1000)
+        self.assertEqual(view.bot.backups, 2)
+
+    def test_reshuffle_clears_round_score(self):
+        view = _view(self.store)
+        asyncio_run(view._settle(FakeInteraction(), winner_number=1))
+        asyncio_run(view._settle(FakeInteraction(), winner_number=2))
+        self.assertEqual(view.rounds.count, 2)
+        scores_before = {user_id: self.store.score_of(7, user_id) for user_id in (101, 102, 201, 202)}
+
+        interaction = FakeInteraction()
+        asyncio_run(view.reshuffle.callback(interaction))
+
+        self.assertEqual(view.rounds.count, 0)
+        self.assertEqual(view.rounds.score_line(), "1팀 0승 vs 2팀 0승")
+        embed = interaction.edits[0]["embed"]
+        self.assertEqual(len(embed.fields), 2, "새 판에서는 정산·스코어 필드가 사라져야 해요")
+        self.assertIn("0 : 0", embed.description)
+        buttons = _buttons(view)
+        self.assertTrue(buttons["team_bot:undo"].disabled)
+        self.assertFalse(buttons["team_bot:win1"].disabled)
+        # 팀 조합은 새로 짜이지만, 이미 쌓인 점수 자체는 그대로 남습니다.
+        self.assertEqual(len(view.team1) + len(view.team2), 4)
+        self.assertEqual({user_id: self.store.score_of(7, user_id) for user_id in (101, 102, 201, 202)}, scores_before)
 
     def test_commands_registered(self):
         names = {command.name for command in team_bot.bot.tree.get_commands()}
