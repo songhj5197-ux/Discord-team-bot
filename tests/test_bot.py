@@ -616,5 +616,159 @@ class BackupChannelTests(unittest.TestCase):
         self.assertEqual(asyncio_run(FakeTeamBot(self._store("b.json"), guild).restore_guild(guild)), 0)
 
 
+class _StubHttp:
+    """길드/전역 명령어 등록 호출을 기록만 하는 가짜 HTTP 클라이언트."""
+
+    def __init__(self):
+        self.calls = []          # ("guild"|"global", guild_id, [이름], payload)
+
+    def _record(self, kind, guild_id, payload):
+        self.calls.append((kind, guild_id, [item["name"] for item in payload], payload))
+        return []
+
+    async def bulk_upsert_guild_commands(self, application_id, guild_id, payload):
+        return self._record("guild", guild_id, payload)
+
+    async def bulk_upsert_global_commands(self, application_id, payload):
+        return self._record("global", None, payload)
+
+
+class _FailingHttp(_StubHttp):
+    """길드 등록이 항상 실패하는 가짜 HTTP 클라이언트."""
+
+    async def bulk_upsert_guild_commands(self, application_id, guild_id, payload):
+        super().bulk_upsert_guild_commands(application_id, guild_id, payload)
+        raise team_bot.discord.HTTPException(_FakeResponse(500), "boom")
+
+
+class _StubConnection:
+    def __init__(self):
+        self._command_tree = None
+        self._translator = None
+
+
+class _StubClient:
+    application_id = 987654321
+
+    def __init__(self, http):
+        self.http = http
+        self._connection = _StubConnection()
+
+
+class _SyncGuild:
+    def __init__(self, guild_id):
+        self.id = guild_id
+        self.name = f"서버{guild_id}"
+
+
+EXPECTED_COMMANDS = {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널"}
+
+
+class CommandSyncBot:
+    """TeamBot 의 슬래시 명령어 동기화 메서드만 빌려 쓰는 가짜 봇."""
+
+    register_commands_for_guild = team_bot.TeamBot.register_commands_for_guild
+    _restore_global_snapshot = team_bot.TeamBot._restore_global_snapshot
+    sync_commands_to_guilds = team_bot.TeamBot.sync_commands_to_guilds
+    clear_global_commands = team_bot.TeamBot.clear_global_commands
+    on_guild_join = team_bot.TeamBot.on_guild_join
+
+    def __init__(self, http, guilds):
+        self.tree = team_bot.app_commands.CommandTree(_StubClient(http))
+        for command in team_bot.bot.tree.get_commands(guild=None):
+            self.tree.add_command(command)
+        self._guilds = list(guilds)
+        self._synced_guild_ids = set()
+        self._global_commands_cleared = False
+        self._command_snapshot = []
+
+    @property
+    def guilds(self):
+        return list(self._guilds)
+
+
+class CommandSyncTests(unittest.TestCase):
+    """서버별(길드) 슬래시 명령어 즉시 동기화 테스트."""
+
+    def setUp(self):
+        self.http = _StubHttp()
+        self.bot = CommandSyncBot(self.http, [_SyncGuild(11), _SyncGuild(22)])
+
+    def _guild_calls(self):
+        return [call for call in self.http.calls if call[0] == "guild"]
+
+    def _global_calls(self):
+        return [call for call in self.http.calls if call[0] == "global"]
+
+    def test_every_guild_gets_every_command_before_global_is_cleared(self):
+        asyncio_run(self.bot.sync_commands_to_guilds())
+
+        guild_calls = self._guild_calls()
+        self.assertEqual([call[1] for call in guild_calls], [11, 22])
+        for _kind, _guild_id, names, _payload in guild_calls:
+            self.assertEqual(set(names), EXPECTED_COMMANDS)
+
+        # 전역은 모든 길드 등록이 끝난 뒤에, 빈 목록으로 한 번만 비웁니다.
+        self.assertEqual(self.http.calls[-1][0], "global")
+        self.assertEqual(self.http.calls[-1][2], [])
+        self.assertEqual(len(self._global_calls()), 1)
+
+    def test_new_options_are_in_guild_payload(self):
+        asyncio_run(self.bot.sync_commands_to_guilds())
+        _kind, _guild_id, _names, payload = self._guild_calls()[0]
+        payload_by_name = {item["name"]: item for item in payload}
+        split_options = {option["name"]: option for option in payload_by_name["팀나누기"]["options"]}
+        self.assertIn("방식", split_options)
+        self.assertEqual({choice["name"] for choice in split_options["방식"]["choices"]}, {"밸런스", "무작위"})
+        self.assertFalse(split_options["방식"]["required"])
+        self.assertIn("채널", {option["name"] for option in payload_by_name["기록채널"]["options"]})
+        self.assertIn("멤버", {option["name"] for option in payload_by_name["점수설정"]["options"]})
+
+    def test_globals_cleared_once_and_memory_kept_for_later_copy(self):
+        asyncio_run(self.bot.sync_commands_to_guilds())
+        self.assertTrue(self.bot._global_commands_cleared)
+        # 메모리에는 원본이 남아 있어야 새 서버에 다시 복사할 수 있습니다.
+        self.assertEqual(len(self.bot.tree.get_commands(guild=None)), len(EXPECTED_COMMANDS))
+
+        # 재접속으로 on_ready 가 다시 불려도 전역을 또 건드리거나 중복 등록하지 않습니다.
+        asyncio_run(self.bot.sync_commands_to_guilds())
+        self.assertEqual(len(self._global_calls()), 1)
+        self.assertEqual(len(self._guild_calls()), 2)
+
+    def test_new_guild_gets_commands_on_join(self):
+        asyncio_run(self.bot.sync_commands_to_guilds())
+        self.http.calls.clear()
+
+        asyncio_run(self.bot.on_guild_join(_SyncGuild(33)))
+
+        self.assertEqual(len(self.http.calls), 1)
+        kind, guild_id, names, _payload = self.http.calls[0]
+        self.assertEqual((kind, guild_id), ("guild", 33))
+        self.assertEqual(set(names), EXPECTED_COMMANDS)
+        self.assertIn(33, self.bot._synced_guild_ids)
+
+    def test_join_before_first_sync_is_left_to_on_ready(self):
+        asyncio_run(self.bot.on_guild_join(_SyncGuild(44)))
+        self.assertEqual(self.http.calls, [])
+
+    def test_failed_guild_sync_keeps_global_commands(self):
+        http = _FailingHttp()
+        bot = CommandSyncBot(http, [_SyncGuild(55)])
+        asyncio_run(bot.sync_commands_to_guilds())      # 예외 없이 끝나야 함
+
+        self.assertFalse(bot._global_commands_cleared)
+        self.assertFalse([call for call in http.calls if call[0] == "global"])
+        # 전역 명령어는 그대로 남아 최소한 예전 명령어는 보입니다.
+        self.assertEqual(len(bot.tree.get_commands(guild=None)), len(EXPECTED_COMMANDS))
+
+    def test_guild_scope_holds_copied_commands(self):
+        guild = _SyncGuild(11)
+        asyncio_run(self.bot.register_commands_for_guild(guild))
+        names = {command.name for command in self.bot.tree.get_commands(guild=guild)}
+        self.assertEqual(names, EXPECTED_COMMANDS)
+        # 전역에도 그대로 남아 있어 두 곳에서 중복 등록되지 않습니다.
+        self.assertEqual(len(self.bot.tree.get_commands(guild=None)), len(EXPECTED_COMMANDS))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -57,10 +57,9 @@ DISCORD_BOT_TOKEN=여기에_복사한_토큰
 python bot.py
 ```
 
-`로그인 완료: ...` 가 뜨면 성공이에요. 슬래시 명령어는 전역 등록이라 처음 한 번은
-디스코드에 나타나기까지 최대 1시간쯤 걸릴 수 있어요. 바로 쓰고 싶다면 `.env` 에
-`DISCORD_GUILD_ID=서버_ID` 를 넣으세요 (서버 ID: 디스코드 설정 → 고급 → 개발자 모드 ON →
-서버 우클릭 → 서버 ID 복사).
+`로그인 완료: ...` 가 뜨면 성공이에요. 슬래시 명령어는 봇이 접속한 **모든 서버에 길드 명령어로
+곧바로 등록**되므로 새 명령어도 디스코드에 바로 보입니다(전역 목록은 중복 방지를 위해 비웁니다).
+그래도 안 보이면 디스코드 앱을 껐다 켜 주세요(입력창에 `/` 를 치면 목록이 새로 고쳐집니다).
 
 ## 4. 사용법
 
@@ -110,8 +109,8 @@ Render · Koyeb · Cloudtype 처럼 **Web Service(웹 서비스)** 타입으로 
 | --- | --- |
 | Build / Install Command | `pip install -r requirements.txt` |
 | Start Command | `python bot.py` |
-| 환경변수 | `DISCORD_BOT_TOKEN` (필수), `DISCORD_GUILD_ID` (권장) |
-| 선택 환경변수 | `SCORE_FILE` (점수 파일 경로, 기본 `data/scores.json`) |
+| 환경변수 | `DISCORD_BOT_TOKEN` (필수) |
+| 선택 환경변수 | `DISCORD_GUILD_ID` (특정 서버를 로그인 전에 미리 등록), `SCORE_FILE` (점수 파일 경로, 기본 `data/scores.json`) |
 | Health Check Path | `/health` |
 | 배포 방식 | GitHub 저장소 연결 후 Python 또는 Dockerfile 빌드 |
 
@@ -154,7 +153,7 @@ curl http://localhost:8080/health
 | --- | --- |
 | 봇이 켜지지 않고 `PrivilegedIntentsRequired` | 개발자 포털 → Bot → **SERVER MEMBERS INTENT** ON |
 | `LoginFailure` / 토큰 오류 | 토큰을 다시 복사 (Reset Token 후 새 값) |
-| 명령어가 안 보여요 | 전역 등록은 최대 1시간. `DISCORD_GUILD_ID` 를 넣으면 즉시 등록 |
+| 명령어가 안 보여요 | 봇이 접속한 서버에 길드 명령어로 즉시 등록됩니다(전역은 비움). 디스코드 앱을 껐다 켜거나 입력창에 `/` 를 쳐서 목록을 새로 고쳐 보세요. 그래도 안 되면 Render 로그에 `길드 명령어 동기화 완료` 가 있는지 확인 |
 | "먼저 대기방 음성 채널에 들어간 뒤..." | 봇을 부른 사람이 음성 채널에 있어야 해요 |
 | "인원이 1명뿐이에요" | 봇 제외 2명 이상 필요 |
 | "멤버 이동 권한이 없어요" | 봇 역할에 **Move Members** 권한, 해당 채널 권한에서도 허용 |

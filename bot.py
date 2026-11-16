@@ -68,8 +68,9 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
-# (선택) 서버 ID 를 넣으면 슬래시 명령어가 그 서버에 곧바로 등록됩니다.
-# 비워 두면 전역 등록이라 디스코드에 반영되기까지 최대 1시간 정도 걸릴 수 있어요.
+# (선택) 서버 ID. 넣지 않아도 봇이 접속한 모든 서버에 슬래시 명령어를
+# 곧바로(길드 명령어로) 등록합니다. 전역 명령어는 캐시 때문에 최대 1시간이
+# 걸리고 같은 이름이 두 개씩 보일 수 있어, 길드 명령어만 사용합니다.
 GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else None
 
@@ -981,21 +982,126 @@ class TeamBot(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
         self.store = store or ScoreStore(SCORE_FILE)
         self._restore_tried: set[int] = set()
+        # -- 슬래시 명령어 동기화 상태 --------------------------------------
+        self._synced_guild_ids: set[int] = set()      # 명령어를 등록해 둔 서버
+        self._global_commands_cleared = False          # 전역 목록을 비웠는지
+        self._command_snapshot: list[Any] = []         # 전역 명령어 원본 (복사용)
 
+    # -- 슬래시 명령어 -------------------------------------------------------
     async def setup_hook(self) -> None:
-        # 슬래시 명령어를 디스코드에 등록합니다.
-        await self.tree.sync()
-        LOG.info("슬래시 명령어 전역 동기화 완료")
+        """로그인 전 준비. 전역 목록을 기억해 두고, 서버 ID가 있으면 먼저 등록합니다.
 
-        # GUILD_ID 를 넣었다면 그 서버에 즉시 등록해서 기다리지 않아도 되게 합니다.
+        디스코드는 전역 명령어를 최대 1시간까지 캐시하기 때문에, 전역으로만
+        등록하면 새 명령어가 늦게 보입니다. 그래서 봇이 접속한 모든 서버에
+        '길드 명령어'로 복사해 즉시 보이게 하고, 전역 목록은 비워서 같은
+        명령어가 두 개씩 뜨지 않게 합니다. 전역 목록을 비우면 메모리에서도
+        사라지므로, 나중에 새로 초대된 서버에 다시 복사할 수 있도록 원본을
+        따로 남겨 둡니다.
+        """
+        self._command_snapshot = list(self.tree.get_commands(guild=None))
+        LOG.info(
+            "슬래시 명령어 %d개 확인: %s",
+            len(self._command_snapshot),
+            ", ".join(command.name for command in self._command_snapshot) or "(없음)",
+        )
+
+        # DISCORD_GUILD_ID 를 넣었다면 로그인 전에도 그 서버에 먼저 등록해 둡니다.
         if GUILD_ID is not None:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            LOG.info("서버(%s)에 슬래시 명령어를 즉시 등록했어요", GUILD_ID)
+            await self.register_commands_for_guild(discord.Object(id=GUILD_ID))
+
+    async def register_commands_for_guild(self, guild: discord.abc.Snowflake) -> int:
+        """한 서버에 슬래시 명령어를 곧바로 등록합니다. 등록된 개수를 돌려줍니다."""
+        # 전역 목록을 비우는 중에 들어온 요청이면 복사할 원본이 없다고
+        # 빈 목록을 등록(기존 명령어 삭제)하지 않도록 먼저 되돌려 둡니다.
+        if not self.tree.get_commands(guild=None):
+            self._restore_global_snapshot()
+
+        self.tree.copy_global_to(guild=guild)
+        synced = await self.tree.sync(guild=guild)
+        self._synced_guild_ids.add(guild.id)
+        LOG.info("서버(%s) 슬래시 명령어 %d개 등록 완료", guild.id, len(synced))
+        return len(synced)
+
+    def _restore_global_snapshot(self) -> None:
+        """비워 둔 전역 명령어 원본을 메모리에 되돌립니다 (길드 복사용)."""
+        for command in self._command_snapshot:
+            try:
+                self.tree.add_command(command)
+            except app_commands.CommandAlreadyRegistered:
+                pass
+
+    async def sync_commands_to_guilds(self) -> int:
+        """봇이 접속한 모든 서버에 슬래시 명령어를 즉시 등록합니다.
+
+        모든 서버 등록이 끝난 뒤에야 전역 목록을 비웁니다(순서 중요).
+        전역을 먼저 비우면 복사할 원본이 사라져 길드 등록이 불가능해집니다.
+        """
+        guilds = list(self.guilds)
+        if not guilds and GUILD_ID is None:
+            LOG.info("접속한 서버가 없어 길드 명령어 동기화를 건너뛰었어요")
+            return 0
+
+        synced_total = 0
+        for guild in guilds:
+            if guild.id in self._synced_guild_ids:
+                continue
+            try:
+                await self.register_commands_for_guild(guild)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                LOG.warning("서버(%s) 명령어 등록에 실패했어요: %s", guild.id, exc)
+            except Exception:
+                LOG.exception("서버(%s) 명령어 등록 중 오류", guild.id)
+            else:
+                synced_total += 1
+
+        # 등록에 성공한 서버가 하나라도 있을 때만 전역 목록을 비웁니다.
+        # (전부 실패했다면 전역 명령어를 남겨 두어 최소한 예전 명령어는 보이게)
+        if self._synced_guild_ids:
+            await self.clear_global_commands()
+            LOG.info(
+                "길드 명령어 동기화 완료: 서버 %d곳 (%s)",
+                len(self._synced_guild_ids),
+                ", ".join(str(guild_id) for guild_id in sorted(self._synced_guild_ids)),
+            )
+        return synced_total
+
+    async def clear_global_commands(self) -> None:
+        """길드 명령어와 겹쳐 2개씩 보이지 않도록 전역 명령어를 비웁니다."""
+        if self._global_commands_cleared:
+            return
+        if not self._command_snapshot:
+            self._command_snapshot = list(self.tree.get_commands(guild=None))
+
+        self.tree.clear_commands(guild=None)
+        try:
+            removed = await self.tree.sync()
+        finally:
+            # 메모리에는 원본을 다시 채워 둡니다. 이래야 새로 초대된 서버에
+            # copy_global_to 로 같은 명령어를 복사할 수 있습니다.
+            # (디스코드에 다시 전역 등록하지는 않으므로 중복은 생기지 않습니다.)
+            self._restore_global_snapshot()
+        self._global_commands_cleared = True
+        LOG.info("전역 슬래시 명령어를 비웠어요 (%d개 → 서버별 명령어만 남김)", len(removed))
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """새 서버에 초대되면 그 서버에도 곧바로 명령어를 등록합니다."""
+        LOG.info("새 서버에 초대됐어요: %s(%s)", guild.name, guild.id)
+        if not self._global_commands_cleared:
+            # 아직 첫 로그인 전이면 on_ready 의 일괄 동기화가 처리합니다.
+            return
+        try:
+            await self.register_commands_for_guild(guild)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            LOG.warning("새 서버(%s) 명령어 등록에 실패했어요: %s", guild.id, exc)
+        except Exception:
+            LOG.exception("새 서버(%s) 명령어 등록 중 오류", guild.id)
 
     async def on_ready(self) -> None:
         LOG.info("로그인 완료: %s (서버 %d곳)", self.user, len(self.guilds))
+        try:
+            await self.sync_commands_to_guilds()
+        except Exception:
+            LOG.exception("슬래시 명령어 동기화 중 오류 (봇은 계속 동작해요)")
         await self.restore_missing_guilds()
 
     # -- 백업 채널 -----------------------------------------------------------
