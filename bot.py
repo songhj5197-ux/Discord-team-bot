@@ -1,15 +1,34 @@
-"""디스코드 팀 나누기 봇.
+"""디스코드 내전 팀 나누기 봇.
 
-대기방(로비) 음성 채널에 모인 멤버를 무작위로 두 팀으로 나누고,
+대기방(로비) 음성 채널에 모인 멤버를 두 팀으로 나누고,
 미리 만들어 둔 두 개의 음성 채널로 한 번에 이동시켜 줍니다.
+팀은 점수(티어)를 고려해 최대한 균형 있게 나눌 수 있고,
+경기 결과를 버튼으로 정산해 점수·승패를 기록합니다.
 
 명령어
-    /팀나누기  팀1_채널 팀2_채널   → 대기방 인원을 반반으로 나눠 이동
+    /팀나누기  팀1_채널 팀2_채널 [방식]   → 대기방 인원을 두 팀으로 나눠 이동
+                                          방식: 밸런스(기본) / 무작위
     /모이기    대상_채널1 [모일_채널] [대상_채널2] → 흩어진 인원을 한 채널로 모음
+    /점수설정  멤버 점수                → 멤버 점수 수동 설정 (0~5000)
+    /점수초기화 [멤버]                  → 멤버(또는 서버 전체) 점수를 1000점으로
+    /랭킹                              → 서버 점수 순위표
+    /기록채널  채널                     → 점수 백업용 텍스트 채널 지정
 
 결과 메시지의 버튼
-    🔀 다시 섞기          같은 인원을 다시 섞어 이동
+    🔀 다시 섞기          같은 인원을 다시 섞어 이동 (새 판으로 리셋)
+    🏆 1팀 승리         1팀 승리로 점수 정산 (한 판에 한 번)
+    🏆 2팀 승리         2팀 승리로 점수 정산 (한 판에 한 번)
     📢 대기방으로 모으기   두 팀 채널의 인원을 처음 대기방으로 복귀
+
+점수
+    새 멤버는 1000점에서 시작하고, 승리 시 +15~+35점, 패배 시 -15~-30점이
+    반영됩니다(Elo 방식, 점수 차이가 클수록 변동 폭이 커짐). 점수는 0점 아래로
+    내려가지 않습니다. 티어는 아이언 ~ 챌린저까지 8단계입니다.
+
+저장
+    data/scores.json 에 길드별 점수를 저장하고, /기록채널 로 지정한 채널
+    (또는 이름이 '소현봇-기록' 인 채널)에 JSON 백업 메시지를 남깁니다.
+    봇이 새로 켜졌을 때 그 채널에서 점수를 복구합니다.
 
 실행 방법은 같은 폴더의 README.md 를 참고하세요.
 
@@ -23,14 +42,18 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import math
 import os
 import random
+import re
 import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import discord
 from discord import app_commands
@@ -57,6 +80,41 @@ PLACEHOLDER_TOKEN = "여기에_봇_토큰_입력"
 DEFAULT_HEALTH_PORT = 8080        # PORT 없이 ENABLE_HEALTH_SERVER 만 켰을 때
 HEALTH_PATHS = {"/", "/health", "/healthz"}
 
+# -- 점수 / 티어 -------------------------------------------------------------
+DEFAULT_SCORE = 1000              # 새 멤버 기본 점수
+MIN_SCORE = 0                     # 점수 하한
+MAX_SET_SCORE = 5000              # /점수설정 상한
+BALANCE_TOLERANCE = 12.0          # 팀 평균 점수차 허용 폭 (후보를 고를 때)
+
+# (최소 점수, 이모지, 티어 이름) — 위에서부터 확인
+TIER_TABLE: tuple[tuple[int, str, str], ...] = (
+    (1500, "👑", "챌린저"),
+    (1350, "💎", "다이아"),
+    (1200, "💠", "에메랄드"),
+    (1100, "🔷", "플래티넘"),
+    (1000, "🥇", "골드"),
+    (900, "🥈", "실버"),
+    (800, "🥉", "브론즈"),
+    (0, "🪨", "아이언"),
+)
+
+MODE_BALANCE = "balance"
+MODE_RANDOM = "random"
+MODE_LABELS = {MODE_BALANCE: "밸런스", MODE_RANDOM: "무작위"}
+
+# -- 저장 / 백업 -------------------------------------------------------------
+SCORE_FILE = os.getenv("SCORE_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "scores.json"
+)
+BACKUP_CHANNEL_NAME = "소현봇-기록"
+BACKUP_HEADER = "<!-- team-bot-scores:v1 p{index}/{total} -->"
+BACKUP_MARKER_RE = re.compile(r"<!--\s*team-bot-scores:v1\s+p(\d+)/(\d+)\s*-->")
+BACKUP_CODE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", re.DOTALL)
+BACKUP_MESSAGE_LIMIT = 2000       # 디스코드 메시지 최대 길이
+BACKUP_CHUNK_SIZE = 1700          # 한 메시지에 담는 JSON 조각 길이
+BACKUP_HISTORY_LIMIT = 100        # 채널 기록에서 백업 메시지를 찾을 때 훑는 개수
+BACKUP_EXTRA_CHANNELS = 8         # 이름이 다른 채널까지 훑을 때 최대 개수
+
 LOG = logging.getLogger("team_bot")
 
 
@@ -70,6 +128,184 @@ class TeamBotError(commands.CommandError):
 
 
 # ---------------------------------------------------------------------------
+# 티어 · 점수 계산
+# ---------------------------------------------------------------------------
+
+
+def tier_for(score: int) -> tuple[str, str]:
+    """점수에 해당하는 (이모지, 티어 이름)."""
+    for threshold, emoji, name in TIER_TABLE:
+        if score >= threshold:
+            return emoji, name
+    return TIER_TABLE[-1][1], TIER_TABLE[-1][2]
+
+
+def tier_label(score: int) -> str:
+    """'👑 챌린저' 처럼 이모지와 티어 이름을 붙인 문자열."""
+    emoji, name = tier_for(score)
+    return f"{emoji} {name}"
+
+
+def elo_deltas(winner_avg: float, loser_avg: float) -> tuple[int, int]:
+    """두 팀 평균 점수로 승리 팀 상승폭과 패배 팀 하락폭을 정합니다.
+
+    * 승리: +15 ~ +35 (동점 +25)
+    * 패배: -15 ~ -30 (동점 -20)
+    * 점수가 낮은 팀이 이기면(업셋) 더 많이 오르고, 진 팀은 적게 잃습니다.
+    """
+    diff = loser_avg - winner_avg                    # +면 승리 팀이 약체
+    ratio = max(-1.0, min(1.0, diff / 150.0))
+    gain = int(round(25 + 10 * ratio))               # 15 ~ 35
+    gain = max(15, min(35, gain))
+    loss = int(round(20 - 10 * ratio))               # 10 ~ 30 → 15 ~ 30 로 보정
+    loss = max(15, min(30, loss))
+    return gain, loss
+
+
+# ---------------------------------------------------------------------------
+# 팀 나누기
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Player:
+    """점수 계산·표시에 쓰는 참가자 정보."""
+
+    member_id: int
+    name: str
+    score: int
+
+    @property
+    def tier(self) -> str:
+        return tier_label(self.score)
+
+    def line(self) -> str:
+        return f"{tier_label(self.score)} · {self.score}점 · {self.name}"
+
+
+def team_average(team: Sequence[Player]) -> float:
+    return sum(player.score for player in team) / len(team) if team else 0.0
+
+
+def _greedy_split(scores: Sequence[int], k: int, m: int, rng: random.Random) -> tuple[list[int], list[int], int]:
+    """점수 큰 사람부터 낮은 쪽 팀에 넣는 휴리스틱 + 교환 개선."""
+    order = list(range(len(scores)))
+    rng.shuffle(order)
+    order.sort(key=lambda index: scores[index], reverse=True)
+
+    team1: list[int] = []
+    team2: list[int] = []
+    sum1 = sum2 = 0
+    for index in order:
+        if len(team1) < k and (len(team2) >= m or sum1 <= sum2):
+            team1.append(index)
+            sum1 += scores[index]
+        else:
+            team2.append(index)
+            sum2 += scores[index]
+
+    # 두 팀에서 한 명씩 바꿔 점수차를 줄일 수 있으면 바꿉니다.
+    for _ in range(80):
+        best_delta = 0
+        best_pair: Optional[tuple[int, int]] = None
+        current = abs(sum1 - sum2)
+        for a in team1:
+            for b in team2:
+                delta = scores[b] - scores[a]                # team1 합 변화량
+                improvement = current - abs(sum1 + delta - (sum2 - delta))
+                if improvement > best_delta:
+                    best_delta = improvement
+                    best_pair = (a, b)
+        if best_pair is None:
+            break
+        a, b = best_pair
+        team1.remove(a)
+        team2.remove(b)
+        team1.append(b)
+        team2.append(a)
+        sum1 += scores[b] - scores[a]
+        sum2 += scores[a] - scores[b]
+
+    return team1, team2, sum1
+
+
+def balanced_split(
+    players: Sequence[Player],
+    *,
+    rng: Optional[random.Random] = None,
+    tolerance: float = BALANCE_TOLERANCE,
+) -> tuple[list[Player], list[Player]]:
+    """인원수를 맞추면서 두 팀 평균 점수차가 최소가 되는 조합을 고릅니다.
+
+    최소 점수차와 비슷한(같은) 후보들 중 하나를 무작위로 골라,
+    같은 인원·같은 점수라도 매번 똑같은 팀이 나오지 않게 합니다.
+    """
+    rng = rng or random
+    pool = list(players)
+    n = len(pool)
+    if n < 2:
+        return pool, []
+    k = math.ceil(n / 2)
+    m = n - k
+    scores = [player.score for player in pool]
+    total = sum(scores)
+
+    def avg_diff(sum1: int) -> float:
+        avg1 = sum1 / k
+        avg2 = (total - sum1) / m if m else 0.0
+        return abs(avg1 - avg2)
+
+    best = math.inf
+    candidates: list[tuple[tuple[int, ...], float]] = []
+
+    def remember(team1: Sequence[int], diff: float) -> None:
+        nonlocal best
+        candidates.append((tuple(sorted(team1)), diff))
+        if diff < best:
+            best = diff
+        if len(candidates) > 4096:
+            candidates.sort(key=lambda item: item[1])
+            del candidates[1024:]
+
+    if n <= 18:
+        # 인원이 적을 때는 모든 조합을 확인합니다. (10명이면 252가지)
+        for combo in itertools.combinations(range(n), k):
+            remember(combo, avg_diff(sum(scores[i] for i in combo)))
+    else:
+        # 인원이 많을 때는 무작위 휴리스틱을 여러 번 돌립니다.
+        for _ in range(240):
+            team1, _team2, sum1 = _greedy_split(scores, k, m, rng)
+            remember(team1, avg_diff(sum1))
+
+    limit = best + tolerance + 1e-9
+    pool_of_choices = [combo for combo, diff in candidates if diff <= limit]
+    if not pool_of_choices:
+        pool_of_choices = [min(candidates, key=lambda item: item[1])[0]]
+
+    chosen = set(rng.choice(pool_of_choices))
+    team1 = [pool[index] for index in range(n) if index in chosen]
+    team2 = [pool[index] for index in range(n) if index not in chosen]
+    rng.shuffle(team1)
+    rng.shuffle(team2)
+    return team1, team2
+
+
+def random_split(players: Sequence[Player], *, rng: Optional[random.Random] = None) -> tuple[list[Player], list[Player]]:
+    """인원만 반반으로 나누는 완전 무작위 분배 (홀수면 팀 1이 한 명 더)."""
+    rng = rng or random
+    pool = list(players)
+    rng.shuffle(pool)
+    half = math.ceil(len(pool) / 2)
+    return pool[:half], pool[half:]
+
+
+def split_players(players: Sequence[Player], mode: str) -> tuple[list[Player], list[Player]]:
+    if mode == MODE_RANDOM:
+        return random_split(players)
+    return balanced_split(players)
+
+
+# ---------------------------------------------------------------------------
 # 공용 도우미
 # ---------------------------------------------------------------------------
 
@@ -79,14 +315,6 @@ def human_voice_members(channel: Optional[discord.VoiceChannel]) -> list[discord
     if channel is None:
         return []
     return [member for member in channel.members if not member.bot]
-
-
-def split_two(members: Sequence[discord.Member]) -> tuple[list[discord.Member], list[discord.Member]]:
-    """무작위로 섞어 두 팀으로 나눕니다. (인원이 홀수면 팀 1이 한 명 더)"""
-    pool = list(members)
-    random.shuffle(pool)
-    half = math.ceil(len(pool) / 2)
-    return pool[:half], pool[half:]
 
 
 async def move_members(
@@ -137,6 +365,16 @@ def ensure_can_move(guild: discord.Guild, *channels: discord.VoiceChannel) -> No
             )
 
 
+def ensure_score_manager(interaction: discord.Interaction) -> None:
+    """점수를 바꾸는 명령은 '멤버 이동' 또는 '서버 관리' 권한이 필요합니다."""
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    if permissions is not None and (permissions.move_members or permissions.manage_guild):
+        return
+    raise TeamBotError(
+        "점수를 바꾸는 명령은 **'멤버 이동'** 또는 **'서버 관리'** 권한이 있는 사람만 쓸 수 있어요."
+    )
+
+
 def _field_value(members: Sequence[discord.Member], limit: int = 1000) -> str:
     """임베드 필드 글자 수 제한(1024자)에 맞춰 멘션 목록을 만듭니다."""
     if not members:
@@ -156,30 +394,517 @@ def _field_value(members: Sequence[discord.Member], limit: int = 1000) -> str:
     return text
 
 
-def build_result_embed(
-    team1: Sequence[discord.Member],
-    team2: Sequence[discord.Member],
-    *,
-    title: str = "🎲 팀 나누기 결과",
-    description: str = "아래처럼 팀을 나눠 각 채널로 이동시켰어요.",
-    footer_extra: str = "",
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        colour=discord.Colour.blurple(),
-    )
-    embed.add_field(name=f"🟦 팀 1 · {len(team1)}명", value=_field_value(team1), inline=True)
-    embed.add_field(name=f"🟥 팀 2 · {len(team2)}명", value=_field_value(team2), inline=True)
-    footer = f"총 {len(team1) + len(team2)}명 무작위 배정"
-    if footer_extra:
-        footer += f" · {footer_extra}"
-    embed.set_footer(text=footer)
-    return embed
+def _team_field(team: Sequence[Player], limit: int = 1000) -> str:
+    """팀 명단(티어·점수·이름)을 임베드 필드 길이에 맞춰 만듭니다."""
+    if not team:
+        return "—"
+    lines: list[str] = []
+    used = 0
+    for player in team:
+        line = player.line()
+        if used + len(line) + 1 > limit:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    hidden = len(team) - len(lines)
+    text = "\n".join(lines)
+    if hidden > 0:
+        text += f"\n… 외 {hidden}명"
+    return text
+
+
+def _settlement_lines(changes: Sequence["ScoreChange"], limit: int = 1000) -> str:
+    if not changes:
+        return "—"
+    lines: list[str] = []
+    used = 0
+    for change in changes:
+        line = f"{change.name} {change.before} → {change.after} ({change.delta:+d})"
+        if used + len(line) + 1 > limit:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    hidden = len(changes) - len(lines)
+    text = "\n".join(lines)
+    if hidden > 0:
+        text += f"\n… 외 {hidden}명"
+    return text
 
 
 def _failure_lines(failed: Sequence[tuple[discord.Member, str]]) -> str:
     return "\n".join(f"• {member.display_name}: {reason}" for member, reason in failed)
+
+
+def build_split_embed(
+    team1: Sequence[Player],
+    team2: Sequence[Player],
+    *,
+    mode: str = MODE_BALANCE,
+    title: str = "⚖️ 팀 나누기 결과",
+    description: str = "아래처럼 팀을 나눠 각 채널로 이동시켰어요.",
+    failed: int = 0,
+    settlement: Optional["Settlement"] = None,
+    winner_number: int = 0,
+) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
+    avg1 = team_average(team1)
+    avg2 = team_average(team2)
+    embed.add_field(
+        name=f"🟦 팀 1 · {len(team1)}명 · 평균 {avg1:.0f}점",
+        value=_team_field(team1),
+        inline=True,
+    )
+    embed.add_field(
+        name=f"🟥 팀 2 · {len(team2)}명 · 평균 {avg2:.0f}점",
+        value=_team_field(team2),
+        inline=True,
+    )
+
+    if settlement is not None:
+        winner_label = f"{winner_number}팀"
+        embed.add_field(
+            name=f"🏆 {winner_label} 승리 · 정산 완료 (+{settlement.gain} / -{settlement.loss})",
+            value=(
+                f"__승리 팀 (+{settlement.gain})__\n{_settlement_lines(settlement.winners)}\n"
+                f"__패배 팀 (-{settlement.loss})__\n{_settlement_lines(settlement.losers)}"
+            )[:1024],
+            inline=False,
+        )
+
+    footer = f"{MODE_LABELS.get(mode, mode)} 배정 · 총 {len(team1) + len(team2)}명 · 평균차 {abs(avg1 - avg2):.0f}점"
+    if failed:
+        footer += f" · 이동 실패 {failed}명"
+    if settlement is not None:
+        footer += " · 정산 완료"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def build_ranking_embed(guild_name: str, rows: Sequence[dict[str, Any]], *, total: int, limit: int = 25) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🏆 {guild_name} 랭킹",
+        colour=discord.Colour.gold(),
+    )
+    if not rows:
+        embed.description = "아직 기록된 점수가 없어요. `/팀나누기` 로 한 판 해보세요!"
+        embed.set_footer(text=f"새 멤버는 {DEFAULT_SCORE}점부터 시작해요.")
+        return embed
+
+    lines: list[str] = []
+    for index, row in enumerate(rows[:limit], start=1):
+        played = row["wins"] + row["losses"]
+        rate = f"{row['wins'] / played * 100:.0f}%" if played else "-"
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"{index}.")
+        lines.append(
+            f"{medal} **{row['name'] or '알 수 없음'}** · {tier_label(row['score'])} {row['score']}점 · "
+            f"{row['wins']}승 {row['losses']}패 ({rate})"
+        )
+    embed.description = "\n".join(lines)
+    footer = f"참가자 {total}명"
+    if len(rows) > limit:
+        footer += f" · 상위 {limit}명만 표시"
+    embed.set_footer(text=footer)
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# 점수 저장소
+# ---------------------------------------------------------------------------
+
+
+def _clean_name(name: str) -> str:
+    """백업 JSON·임베드를 깨뜨리지 않도록 이름을 정리합니다."""
+    text = (name or "").replace("`", "'").replace("\n", " ").replace("\r", " ")
+    return text.strip()[:40]
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass
+class ScoreChange:
+    user_id: int
+    name: str
+    before: int
+    after: int
+    tier_before: str
+    tier_after: str
+
+    @property
+    def delta(self) -> int:
+        return self.after - self.before
+
+
+@dataclass
+class Settlement:
+    gain: int
+    loss: int
+    winners: list[ScoreChange] = field(default_factory=list)
+    losers: list[ScoreChange] = field(default_factory=list)
+
+
+class ScoreStore:
+    """길드별 멤버 점수/승/패를 JSON 파일 하나에 보관합니다."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        self._data: dict[str, Any] = {"version": 1, "guilds": {}}
+        self.load()
+
+    # -- 파일 ---------------------------------------------------------------
+    def load(self) -> bool:
+        try:
+            with open(self.path, encoding="utf-8") as fp:
+                raw = json.load(fp)
+        except FileNotFoundError:
+            return False
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("점수 파일을 읽지 못했어요(%s): %s", self.path, exc)
+            return False
+        if isinstance(raw, dict) and isinstance(raw.get("guilds"), dict):
+            with self._lock:
+                self._data = {"version": 1, "guilds": raw["guilds"]}
+            return True
+        LOG.warning("점수 파일 형식이 올바르지 않아 무시했어요: %s", self.path)
+        return False
+
+    def save(self) -> bool:
+        with self._lock:
+            payload = json.dumps(self._data, ensure_ascii=False, separators=(",", ":"))
+        try:
+            directory = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(directory, exist_ok=True)
+            temporary = f"{self.path}.tmp"
+            with open(temporary, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            LOG.warning("점수 파일을 저장하지 못했어요(%s): %s", self.path, exc)
+            return False
+        return True
+
+    # -- 길드/멤버 -----------------------------------------------------------
+    def _guild(self, guild_id: int, *, create: bool = False) -> Optional[dict[str, Any]]:
+        key = str(guild_id)
+        guild = self._data["guilds"].get(key)
+        if guild is None and create:
+            guild = {"members": {}, "record_channel_id": None, "backup_message_ids": []}
+            self._data["guilds"][key] = guild
+        return guild
+
+    def has_scores(self, guild_id: int) -> bool:
+        with self._lock:
+            guild = self._guild(guild_id)
+            return bool(guild and guild.get("members"))
+
+    def member_count(self, guild_id: int) -> int:
+        with self._lock:
+            guild = self._guild(guild_id)
+            return len(guild.get("members", {})) if guild else 0
+
+    def record_channel_id(self, guild_id: int) -> Optional[int]:
+        with self._lock:
+            guild = self._guild(guild_id)
+            value = guild.get("record_channel_id") if guild else None
+            return value if isinstance(value, int) else None
+
+    def set_record_channel(self, guild_id: int, channel_id: Optional[int]) -> None:
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            guild["record_channel_id"] = channel_id
+
+    def backup_message_ids(self, guild_id: int) -> list[int]:
+        with self._lock:
+            guild = self._guild(guild_id)
+            ids = guild.get("backup_message_ids") if guild else []
+            return [value for value in ids if isinstance(value, int)]
+
+    def set_backup_message_ids(self, guild_id: int, message_ids: Sequence[int]) -> None:
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            guild["backup_message_ids"] = [int(value) for value in message_ids]
+
+    def _ensure_member(self, guild: dict[str, Any], user_id: int, name: Optional[str] = None) -> dict[str, Any]:
+        record = guild["members"].get(str(user_id))
+        if record is None:
+            record = {"score": DEFAULT_SCORE, "wins": 0, "losses": 0, "name": _clean_name(name or "")}
+            guild["members"][str(user_id)] = record
+        elif name:
+            record["name"] = _clean_name(name)
+        return record
+
+    def ensure_player(self, guild_id: int, user_id: int, name: str) -> Player:
+        """멤버를 등록(없으면 기본 점수)하고 Player 로 돌려줍니다."""
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            record = self._ensure_member(guild, user_id, name)
+            return Player(member_id=user_id, name=_clean_name(name) or record.get("name", ""), score=int(record["score"]))
+
+    def score_of(self, guild_id: int, user_id: int) -> int:
+        with self._lock:
+            guild = self._guild(guild_id)
+            if not guild:
+                return DEFAULT_SCORE
+            record = guild["members"].get(str(user_id))
+            return int(record["score"]) if record else DEFAULT_SCORE
+
+    def set_score(self, guild_id: int, user_id: int, score: int, name: str = "") -> tuple[int, int]:
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            record = self._ensure_member(guild, user_id, name or None)
+            before = int(record["score"])
+            record["score"] = max(MIN_SCORE, min(MAX_SET_SCORE, int(score)))
+            return before, int(record["score"])
+
+    def reset_member(self, guild_id: int, user_id: int, name: str = "") -> Optional[int]:
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            record = self._ensure_member(guild, user_id, name or None)
+            before = int(record["score"])
+            record["score"] = DEFAULT_SCORE
+            record["wins"] = 0
+            record["losses"] = 0
+            return before
+
+    def reset_guild(self, guild_id: int) -> int:
+        with self._lock:
+            guild = self._guild(guild_id)
+            if not guild:
+                return 0
+            count = len(guild.get("members", {}))
+            guild["members"] = {}
+            return count
+
+    def settle(
+        self,
+        guild_id: int,
+        winner_ids: Sequence[int],
+        loser_ids: Sequence[int],
+        *,
+        names: Optional[dict[int, str]] = None,
+    ) -> Settlement:
+        """한 판의 승패를 점수에 반영합니다. (점수 하한 0점)"""
+        names = names or {}
+        with self._lock:
+            guild = self._guild(guild_id, create=True)
+            if not winner_ids or not loser_ids:
+                raise TeamBotError("정산할 팀 인원이 없어요. 다시 팀을 나눠 주세요.")
+
+            winner_records = [self._ensure_member(guild, int(uid), names.get(int(uid))) for uid in winner_ids]
+            loser_records = [self._ensure_member(guild, int(uid), names.get(int(uid))) for uid in loser_ids]
+
+            winner_avg = sum(int(record["score"]) for record in winner_records) / len(winner_records)
+            loser_avg = sum(int(record["score"]) for record in loser_records) / len(loser_records)
+            gain, loss = elo_deltas(winner_avg, loser_avg)
+
+            winners: list[ScoreChange] = []
+            for user_id, record in zip(winner_ids, winner_records):
+                before = int(record["score"])
+                after = max(MIN_SCORE, before + gain)
+                record["score"] = after
+                record["wins"] = int(record.get("wins", 0)) + 1
+                winners.append(
+                    ScoreChange(int(user_id), record.get("name", ""), before, after, tier_label(before), tier_label(after))
+                )
+
+            losers: list[ScoreChange] = []
+            for user_id, record in zip(loser_ids, loser_records):
+                before = int(record["score"])
+                after = max(MIN_SCORE, before - loss)
+                record["score"] = after
+                record["losses"] = int(record.get("losses", 0)) + 1
+                losers.append(
+                    ScoreChange(int(user_id), record.get("name", ""), before, after, tier_label(before), tier_label(after))
+                )
+
+            return Settlement(gain=gain, loss=loss, winners=winners, losers=losers)
+
+    def ranking(self, guild_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            guild = self._guild(guild_id)
+            if not guild:
+                return []
+            rows = [
+                {
+                    "user_id": int(user_id),
+                    "name": record.get("name", ""),
+                    "score": int(record.get("score", DEFAULT_SCORE)),
+                    "wins": int(record.get("wins", 0)),
+                    "losses": int(record.get("losses", 0)),
+                }
+                for user_id, record in guild.get("members", {}).items()
+                if str(user_id).isdigit()
+            ]
+        rows.sort(key=lambda row: (-row["score"], -row["wins"], row["name"]))
+        return rows
+
+    # -- 백업 ---------------------------------------------------------------
+    def backup_payload(self, guild_id: int) -> dict[str, Any]:
+        with self._lock:
+            guild = self._guild(guild_id) or {"members": {}, "record_channel_id": None}
+            return {
+                "version": 1,
+                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "guild": {
+                    "id": str(guild_id),
+                    "record_channel_id": guild.get("record_channel_id"),
+                    "members": guild.get("members", {}),
+                },
+            }
+
+    def restore_from_payload(
+        self,
+        guild_id: int,
+        payload: dict[str, Any],
+        *,
+        record_channel_id: Optional[int] = None,
+        message_ids: Sequence[int] = (),
+    ) -> int:
+        """백업 JSON 으로 길드 점수를 되살립니다. 복구한 멤버 수를 돌려줍니다."""
+        guild_part = payload.get("guild") if isinstance(payload, dict) else None
+        raw_members = guild_part.get("members") if isinstance(guild_part, dict) else None
+        if not isinstance(raw_members, dict):
+            return 0
+
+        members: dict[str, dict[str, Any]] = {}
+        for user_id, record in raw_members.items():
+            if not str(user_id).isdigit() or not isinstance(record, dict):
+                continue
+            score = max(MIN_SCORE, _to_int(record.get("score"), DEFAULT_SCORE))
+            members[str(user_id)] = {
+                "score": score,
+                "wins": max(0, _to_int(record.get("wins"), 0)),
+                "losses": max(0, _to_int(record.get("losses"), 0)),
+                "name": _clean_name(str(record.get("name", ""))),
+            }
+        if not members:
+            return 0
+
+        with self._lock:
+            channel_id = record_channel_id
+            if channel_id is None:
+                channel_id = _to_int(guild_part.get("record_channel_id"), 0) or None
+            self._data["guilds"][str(guild_id)] = {
+                "members": members,
+                "record_channel_id": channel_id,
+                "backup_message_ids": [int(value) for value in message_ids],
+            }
+        return len(members)
+
+
+def backup_message_bodies(json_text: str) -> list[str]:
+    """JSON 문자열을 디스코드 메시지 길이에 맞춰 여러 조각으로 나눕니다."""
+    chunks = [json_text[index:index + BACKUP_CHUNK_SIZE] for index in range(0, len(json_text), BACKUP_CHUNK_SIZE)]
+    if not chunks:
+        chunks = [""]
+    total = len(chunks)
+    bodies = []
+    for index, chunk in enumerate(chunks, start=1):
+        header = BACKUP_HEADER.format(index=index, total=total)
+        body = f"{header}\n```json\n{chunk}\n```"
+        if len(body) > BACKUP_MESSAGE_LIMIT:          # 안전장치 (여기까지 오면 안 됨)
+            chunk = chunk[: BACKUP_MESSAGE_LIMIT - len(header) - 12]
+            body = f"{header}\n```json\n{chunk}\n```"
+        bodies.append(body)
+    return bodies
+
+
+def parse_backup_message(content: str) -> Optional[tuple[int, int, str]]:
+    """백업 메시지 하나에서 (조각 번호, 전체 조각 수, JSON 조각)을 꺼냅니다."""
+    match = BACKUP_MARKER_RE.search(content or "")
+    if not match:
+        return None
+    index, total = int(match.group(1)), int(match.group(2))
+    if index < 1 or total < 1 or index > total:
+        return None
+    code = BACKUP_CODE_RE.search(content)
+    if not code:
+        return None
+    return index, total, code.group(1)
+
+
+def assemble_backup(contents: Iterable[str]) -> Optional[tuple[dict[str, Any], list[str]]]:
+    """여러 백업 메시지에서 완전한 조각 묶음을 찾아 JSON 으로 되돌립니다."""
+    groups: dict[int, dict[int, tuple[str, str]]] = {}
+    for content in contents:
+        parsed = parse_backup_message(content)
+        if parsed is None:
+            continue
+        index, total, json_text = parsed
+        groups.setdefault(total, {})[index] = (content, json_text)
+
+    for total in sorted(groups, reverse=True):
+        parts = groups[total]
+        if all(index in parts for index in range(1, total + 1)):
+            ordered = [parts[index] for index in range(1, total + 1)]
+            text = "".join(chunk for _, chunk in ordered)
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("guild"), dict):
+                return payload, [content for content, _ in ordered]
+    return None
+
+
+async def read_backup_channel(
+    channel: discord.TextChannel, *, deep: bool = True
+) -> tuple[Optional[dict[str, Any]], list[int]]:
+    """텍스트 채널의 고정 메시지(와 필요하면 최근 기록)에서 점수 백업을 찾습니다."""
+    contents: dict[int, str] = {}
+
+    def remember(message: discord.Message) -> None:
+        if message.content and BACKUP_MARKER_RE.search(message.content):
+            contents[message.id] = message.content
+
+    try:
+        for message in await channel.pins():
+            remember(message)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    if not contents and deep:
+        try:
+            async for message in channel.history(limit=BACKUP_HISTORY_LIMIT):
+                remember(message)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    if not contents:
+        return None, []
+
+    assembled = assemble_backup(contents.values())
+    if assembled is None:
+        return None, []
+    payload, used_contents = assembled
+    content_to_ids: dict[str, list[int]] = {}
+    for message_id, content in contents.items():
+        content_to_ids.setdefault(content, []).append(message_id)
+    message_ids: list[int] = []
+    for content in used_contents:
+        message_ids.extend(content_to_ids.get(content, []))
+    return payload, message_ids
+
+
+class SettlementGuard:
+    """한 판의 승리 정산이 한 번만 일어나도록 잠그는 도우미."""
+
+    def __init__(self) -> None:
+        self.settled = False
+
+    def try_begin(self) -> bool:
+        if self.settled:
+            return False
+        self.settled = True
+        return True
+
+    def reset(self) -> None:
+        self.settled = False
 
 
 # ---------------------------------------------------------------------------
@@ -243,33 +968,235 @@ def start_health_server(port: int) -> Optional[ThreadingHTTPServer]:
 
 
 # ---------------------------------------------------------------------------
+# 봇 본체
+# ---------------------------------------------------------------------------
+
+
+class TeamBot(commands.Bot):
+    def __init__(self, store: Optional[ScoreStore] = None) -> None:
+        intents = discord.Intents.default()
+        intents.voice_states = True   # 누가 어느 음성 채널에 있는지 확인
+        intents.members = True        # 멤버 목록·이동(권한이 켜져 있어야 동작)
+        intents.guilds = True
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
+        self.store = store or ScoreStore(SCORE_FILE)
+        self._restore_tried: set[int] = set()
+
+    async def setup_hook(self) -> None:
+        # 슬래시 명령어를 디스코드에 등록합니다.
+        await self.tree.sync()
+        LOG.info("슬래시 명령어 전역 동기화 완료")
+
+        # GUILD_ID 를 넣었다면 그 서버에 즉시 등록해서 기다리지 않아도 되게 합니다.
+        if GUILD_ID is not None:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            LOG.info("서버(%s)에 슬래시 명령어를 즉시 등록했어요", GUILD_ID)
+
+    async def on_ready(self) -> None:
+        LOG.info("로그인 완료: %s (서버 %d곳)", self.user, len(self.guilds))
+        await self.restore_missing_guilds()
+
+    # -- 백업 채널 -----------------------------------------------------------
+    def resolve_backup_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """/기록채널 로 정한 채널, 없으면 이름이 '소현봇-기록' 인 채널."""
+        record_id = self.store.record_channel_id(guild.id)
+        if record_id:
+            channel = guild.get_channel(record_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        for channel in guild.text_channels:
+            if channel.name == BACKUP_CHANNEL_NAME:
+                return channel
+        return None
+
+    def _backup_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
+        """복구용으로 살펴볼 후보 채널 (지정 채널 → 이름 일치 → 나머지 일부)."""
+        ordered: list[discord.TextChannel] = []
+        primary = self.resolve_backup_channel(guild)
+        if primary is not None:
+            ordered.append(primary)
+
+        me = guild.me
+        for channel in guild.text_channels:
+            if channel in ordered:
+                continue
+            if me is None or not channel.permissions_for(me).read_message_history:
+                continue
+            ordered.append(channel)
+            if len(ordered) > 1 + BACKUP_EXTRA_CHANNELS:
+                break
+        return ordered
+
+    async def restore_missing_guilds(self) -> None:
+        """메모리에 점수가 없는 길드만 기록 채널에서 복구합니다."""
+        for guild in self.guilds:
+            if self.store.has_scores(guild.id) or guild.id in self._restore_tried:
+                continue
+            self._restore_tried.add(guild.id)
+            try:
+                restored = await self.restore_guild(guild)
+            except Exception:
+                LOG.exception("점수 복구 중 오류: 서버 %s", guild.id)
+                continue
+            if restored:
+                LOG.info("'%s' 서버 점수 %d명을 기록 채널에서 복구했어요", guild.name, restored)
+
+    async def restore_guild(self, guild: discord.Guild) -> int:
+        primary = self.resolve_backup_channel(guild)
+        for channel in self._backup_channels(guild):
+            try:
+                payload, message_ids = await read_backup_channel(channel, deep=(channel == primary))
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            if not payload:
+                continue
+            restored = self.store.restore_from_payload(
+                guild.id, payload, record_channel_id=channel.id, message_ids=message_ids
+            )
+            if restored:
+                self.store.save()
+                return restored
+        return 0
+
+    async def sync_backup(self, guild_id: int) -> None:
+        """점수 JSON 을 기록 채널 메시지에 저장(수정)합니다. 실패해도 봇은 계속 동작합니다."""
+        guild = self.get_guild(guild_id)
+        if guild is None or not self.store.has_scores(guild_id):
+            return
+
+        channel = self.resolve_backup_channel(guild)
+        if channel is None:
+            LOG.info("점수 기록 채널이 없어 파일에만 저장했어요 (서버 %s)", guild_id)
+            return
+
+        me = guild.me
+        permissions = channel.permissions_for(me) if me is not None else None
+        if permissions is not None and not (permissions.send_messages and permissions.read_message_history):
+            LOG.info("'%s' 채널에 백업할 권한이 없어 파일에만 저장했어요", channel.name)
+            return
+
+        payload = self.store.backup_payload(guild_id)
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        bodies = backup_message_bodies(text)
+        existing = list(self.store.backup_message_ids(guild_id))
+        new_ids: list[int] = []
+
+        try:
+            for index, body in enumerate(bodies):
+                message: Optional[discord.Message] = None
+                if index < len(existing):
+                    try:
+                        message = await channel.fetch_message(existing[index])
+                    except discord.NotFound:
+                        message = None
+                    except (discord.Forbidden, discord.HTTPException):
+                        message = None
+                if message is not None:
+                    if message.content != body:
+                        await message.edit(content=body)
+                    new_ids.append(message.id)
+                    continue
+                sent = await channel.send(body)
+                new_ids.append(sent.id)
+                try:
+                    await sent.pin(reason="소현봇 점수 백업")
+                except (discord.Forbidden, discord.HTTPException):
+                    LOG.debug("백업 메시지를 고정하지 못했어요 (%s)", channel.name)
+
+            for stale_id in existing[len(bodies):]:
+                try:
+                    stale = await channel.fetch_message(stale_id)
+                    await stale.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            LOG.warning("점수 백업 메시지를 갱신하지 못했어요(%s): %s", channel.name, exc)
+
+        if new_ids:
+            self.store.set_record_channel(guild_id, channel.id)
+            self.store.set_backup_message_ids(guild_id, new_ids)
+            self.store.save()
+
+
+bot = TeamBot()
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    """슬래시 명령어에서 난 오류를 한국어 안내로 바꿔 조용히 알려 줍니다."""
+    original: BaseException = error
+    if isinstance(error, app_commands.CommandInvokeError):
+        original = error.original
+
+    if isinstance(original, TeamBotError):
+        message = str(original)
+    elif isinstance(error, app_commands.TransformerError):
+        message = "채널을 찾지 못했어요. 목록에서 다시 골라 주세요."
+    elif isinstance(error, app_commands.MissingPermissions):
+        message = "이 명령을 쓰려면 **'멤버 이동'** 권한이 필요해요."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        message = "봇에게 필요한 권한이 없어요. 봇 역할에 **'멤버 이동'** 권한을 켜 주세요."
+    else:
+        LOG.exception("슬래시 명령어 오류: %s", error, exc_info=original)
+        message = "처리 중 예상치 못한 문제가 생겼어요. 잠시 후 다시 시도해 주세요."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        LOG.warning("오류 안내 메시지를 보내지 못했어요")
+
+
+# ---------------------------------------------------------------------------
 # 결과 버튼
 # ---------------------------------------------------------------------------
 
 
+def _button_custom_ids(view: "SplitResultView") -> dict[str, discord.ui.Button]:
+    buttons: dict[str, discord.ui.Button] = {}
+    for child in view.children:
+        if isinstance(child, discord.ui.Button) and child.custom_id:
+            buttons[child.custom_id] = child
+    return buttons
+
+
 class SplitResultView(discord.ui.View):
-    """팀 나누기 결과에 붙는 '다시 섞기' / '대기방으로 모으기' 버튼."""
+    """팀 나누기 결과에 붙는 버튼 4개."""
 
     def __init__(
         self,
         *,
+        bot_: "TeamBot",
         author_id: int,
         guild: discord.Guild,
         lobby: discord.VoiceChannel,
         team1_channel: discord.VoiceChannel,
         team2_channel: discord.VoiceChannel,
-        participants: Sequence[discord.Member],
+        mode: str,
+        team1: Sequence[Player],
+        team2: Sequence[Player],
         timeout: float = BUTTON_TIMEOUT,
     ) -> None:
         super().__init__(timeout=timeout)
+        self.bot = bot_
         self.author_id = author_id
         self.guild = guild
         self.lobby_id = lobby.id
         self.team1_id = team1_channel.id
         self.team2_id = team2_channel.id
-        self.participant_ids: list[int] = [member.id for member in participants]
+        self.mode = mode
+        self.team1: list[Player] = list(team1)
+        self.team2: list[Player] = list(team2)
+        self.guard = SettlementGuard()
         self.message: Optional[discord.Message] = None
         self._lock = asyncio.Lock()
+        self._sync_win_buttons()
 
     # -- 권한 ---------------------------------------------------------------
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -285,6 +1212,11 @@ class SplitResultView(discord.ui.View):
         return False
 
     # -- 도우미 -------------------------------------------------------------
+    def _sync_win_buttons(self) -> None:
+        for custom_id, button in _button_custom_ids(self).items():
+            if custom_id in {"team_bot:win1", "team_bot:win2"}:
+                button.disabled = self.guard.settled
+
     def _resolve(self, channel_id: int, label: str) -> discord.VoiceChannel:
         channel = self.guild.get_channel(channel_id)
         if not isinstance(channel, discord.VoiceChannel):
@@ -295,7 +1227,7 @@ class SplitResultView(discord.ui.View):
         return self._resolve(self.team1_id, "팀 1"), self._resolve(self.team2_id, "팀 2")
 
     def _current_members(self, channels: Sequence[discord.VoiceChannel]) -> list[discord.Member]:
-        """지금 두 팀 채널에 있는 사람들(봇 제외). 부족하면 원래 참가자로 보완."""
+        """지금 두 팀 채널에 있는 사람들(봇 제외). 부족하면 기록된 참가자로 보완."""
         found: dict[int, discord.Member] = {}
         for channel in channels:
             for member in channel.members:
@@ -304,11 +1236,20 @@ class SplitResultView(discord.ui.View):
         if len(found) >= 2:
             return list(found.values())
 
-        for member_id in self.participant_ids:
+        participant_ids = [player.member_id for player in self.team1 + self.team2]
+        for member_id in participant_ids:
             member = self.guild.get_member(member_id)
             if member is not None and not member.bot and member.voice and member.voice.channel:
-                found[member.id] = member
+                found.setdefault(member.id, member)
         return list(found.values())
+
+    def _build_embed(self, **kwargs: Any) -> discord.Embed:
+        return build_split_embed(
+            self.team1,
+            self.team2,
+            mode=self.mode,
+            **kwargs,
+        )
 
     async def on_timeout(self) -> None:
         for child in self.children:
@@ -321,12 +1262,16 @@ class SplitResultView(discord.ui.View):
                 pass
 
     # -- 버튼: 다시 섞기 ----------------------------------------------------
-    @discord.ui.button(label="다시 섞기", emoji="🔀", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="다시 섞기", emoji="🔀", style=discord.ButtonStyle.primary,
+        custom_id="team_bot:reshuffle", row=0,
+    )
     async def reshuffle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self._lock.locked():
             await interaction.response.send_message("지금 이동 중이에요. 잠시만 기다려 주세요.", ephemeral=True)
             return
 
+        failed: list[tuple[discord.Member, str]] = []
         async with self._lock:
             await interaction.response.defer()
             try:
@@ -340,18 +1285,27 @@ class SplitResultView(discord.ui.View):
                         "먼저 대기방에 모인 뒤 `/팀나누기` 를 다시 실행해 주세요."
                     )
 
-                team1, team2 = split_two(members)
-                moved1, failed1 = await move_members(team1, team1_channel, reason="팀 나누기 봇: 다시 섞기")
-                moved2, failed2 = await move_members(team2, team2_channel, reason="팀 나누기 봇: 다시 섞기")
+                players = [self.bot.store.ensure_player(self.guild.id, member.id, member.display_name) for member in members]
+                self.bot.store.save()
+                team1, team2 = split_players(players, self.mode)
+                member_map = {member.id: member for member in members}
 
-                self.participant_ids = [member.id for member in members]
-                all_failed = failed1 + failed2
-                embed = build_result_embed(
-                    moved1,
-                    moved2,
+                moved1, failed1 = await move_members(
+                    [member_map[player.member_id] for player in team1], team1_channel, reason="팀 나누기 봇: 다시 섞기"
+                )
+                moved2, failed2 = await move_members(
+                    [member_map[player.member_id] for player in team2], team2_channel, reason="팀 나누기 봇: 다시 섞기"
+                )
+                failed = failed1 + failed2
+
+                self.team1, self.team2 = team1, team2
+                self.guard.reset()
+                self._sync_win_buttons()
+
+                embed = self._build_embed(
                     title="🔀 다시 섞은 결과",
-                    description="같은 인원을 다시 무작위로 섞어 이동시켰어요.",
-                    footer_extra=f"실패 {len(all_failed)}명" if all_failed else "",
+                    description=f"같은 인원을 **{MODE_LABELS.get(self.mode, self.mode)}** 방식으로 다시 나눠 이동시켰어요.",
+                    failed=len(failed),
                 )
                 await interaction.edit_original_response(embed=embed, view=self)
             except TeamBotError as error:
@@ -364,19 +1318,95 @@ class SplitResultView(discord.ui.View):
                 )
                 return
 
-        if all_failed:
+        if failed:
             await interaction.followup.send(
-                f"⚠️ {len(all_failed)}명은 이동하지 못했어요.\n{_failure_lines(all_failed)}",
+                f"⚠️ {len(failed)}명은 이동하지 못했어요.\n{_failure_lines(failed)}",
                 ephemeral=True,
             )
 
+    # -- 버튼: 승리 정산 ----------------------------------------------------
+    @discord.ui.button(
+        label="1팀 승리", emoji="🏆", style=discord.ButtonStyle.success,
+        custom_id="team_bot:win1", row=0,
+    )
+    async def win_team1(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._settle(interaction, winner_number=1)
+
+    @discord.ui.button(
+        label="2팀 승리", emoji="🏆", style=discord.ButtonStyle.success,
+        custom_id="team_bot:win2", row=0,
+    )
+    async def win_team2(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._settle(interaction, winner_number=2)
+
+    async def _settle(self, interaction: discord.Interaction, *, winner_number: int) -> None:
+        if self._lock.locked():
+            await interaction.response.send_message("지금 처리 중이에요. 잠시만 기다려 주세요.", ephemeral=True)
+            return
+
+        async with self._lock:
+            if not self.guard.try_begin():
+                await interaction.response.send_message(
+                    "이미 승패가 정산된 판이에요. 새로 하려면 **🔀 다시 섞기** 를 눌러 주세요.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            applied = False
+            try:
+                winners = self.team1 if winner_number == 1 else self.team2
+                losers = self.team2 if winner_number == 1 else self.team1
+                if not winners or not losers:
+                    raise TeamBotError("정산할 팀 인원이 없어요. 다시 팀을 나눠 주세요.")
+
+                names = {player.member_id: player.name for player in self.team1 + self.team2}
+                settlement = self.bot.store.settle(
+                    self.guild.id,
+                    [player.member_id for player in winners],
+                    [player.member_id for player in losers],
+                    names=names,
+                )
+                applied = True
+                self.bot.store.save()
+                await self.bot.sync_backup(self.guild.id)
+
+                self._sync_win_buttons()
+                embed = self._build_embed(
+                    title=f"🏆 {winner_number}팀 승리!",
+                    description=(
+                        f"**{winner_number}팀** 승리로 점수를 정산했어요. "
+                        f"(승리 +{settlement.gain} / 패배 -{settlement.loss})"
+                    ),
+                    settlement=settlement,
+                    winner_number=winner_number,
+                )
+                await interaction.edit_original_response(embed=embed, view=self)
+            except TeamBotError as error:
+                if not applied:
+                    self.guard.reset()
+                await interaction.followup.send(str(error), ephemeral=True)
+                return
+            except Exception:
+                LOG.exception("승리 정산 처리 중 오류")
+                if not applied:
+                    self.guard.reset()
+                await interaction.followup.send(
+                    "점수를 정산하는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.", ephemeral=True
+                )
+                return
+
     # -- 버튼: 대기방으로 모으기 --------------------------------------------
-    @discord.ui.button(label="대기방으로 모으기", emoji="📢", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="대기방으로 모으기", emoji="📢", style=discord.ButtonStyle.secondary,
+        custom_id="team_bot:gather", row=0,
+    )
     async def gather_back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self._lock.locked():
             await interaction.response.send_message("지금 이동 중이에요. 잠시만 기다려 주세요.", ephemeral=True)
             return
 
+        failed: list[tuple[discord.Member, str]] = []
         async with self._lock:
             await interaction.response.defer()
             try:
@@ -403,9 +1433,8 @@ class SplitResultView(discord.ui.View):
                     )
                 embed.set_footer(text="다시 하려면 /팀나누기 를 실행해 주세요.")
                 for child in self.children:
-                    if isinstance(child, discord.ui.Button) and child is not button:
+                    if isinstance(child, discord.ui.Button):
                         child.disabled = True
-                button.disabled = True
                 await interaction.edit_original_response(embed=embed, view=self)
                 self.stop()
             except TeamBotError as error:
@@ -425,90 +1454,38 @@ class SplitResultView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# 봇 본체
-# ---------------------------------------------------------------------------
-
-
-class TeamBot(commands.Bot):
-    def __init__(self) -> None:
-        intents = discord.Intents.default()
-        intents.voice_states = True   # 누가 어느 음성 채널에 있는지 확인
-        intents.members = True        # 멤버 목록·이동(권한이 켜져 있어야 동작)
-        intents.guilds = True
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
-
-    async def setup_hook(self) -> None:
-        # 슬래시 명령어를 디스코드에 등록합니다.
-        await self.tree.sync()
-        LOG.info("슬래시 명령어 전역 동기화 완료")
-
-        # GUILD_ID 를 넣었다면 그 서버에 즉시 등록해서 기다리지 않아도 되게 합니다.
-        if GUILD_ID is not None:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            LOG.info("서버(%s)에 슬래시 명령어를 즉시 등록했어요", GUILD_ID)
-
-    async def on_ready(self) -> None:
-        LOG.info("로그인 완료: %s (서버 %d곳)", self.user, len(self.guilds))
-
-
-bot = TeamBot()
-
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction, error: app_commands.AppCommandError
-) -> None:
-    """슬래시 명령어에서 난 오류를 한국어 안내로 바꿔 조용히 알려 줍니다."""
-    original: BaseException = error
-    if isinstance(error, app_commands.CommandInvokeError):
-        original = error.original
-
-    if isinstance(original, TeamBotError):
-        message = str(original)
-    elif isinstance(error, app_commands.TransformerError):
-        message = "채널을 찾지 못했어요. 목록에서 음성 채널을 다시 골라 주세요."
-    elif isinstance(error, app_commands.MissingPermissions):
-        message = "이 명령을 쓰려면 **'멤버 이동'** 권한이 필요해요."
-    elif isinstance(error, app_commands.BotMissingPermissions):
-        message = "봇에게 필요한 권한이 없어요. 봇 역할에 **'멤버 이동'** 권한을 켜 주세요."
-    else:
-        LOG.exception("슬래시 명령어 오류: %s", error, exc_info=original)
-        message = "처리 중 예상치 못한 문제가 생겼어요. 잠시 후 다시 시도해 주세요."
-
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-    except discord.HTTPException:
-        LOG.warning("오류 안내 메시지를 보내지 못했어요")
-
-
-# ---------------------------------------------------------------------------
 # /팀나누기
 # ---------------------------------------------------------------------------
+
+SPLIT_MODE_CHOICES = [
+    app_commands.Choice(name="밸런스", value=MODE_BALANCE),
+    app_commands.Choice(name="무작위", value=MODE_RANDOM),
+]
 
 
 @bot.tree.command(
     name="팀나누기",
-    description="대기방에 모인 인원을 무작위로 두 팀으로 나눠 이동시켜요.",
+    description="대기방에 모인 인원을 점수 밸런스(또는 무작위)로 두 팀으로 나눠 이동시켜요.",
 )
 @app_commands.guild_only()   # DM 목록에는 뜨지 않게
 @app_commands.describe(
     팀1_채널="팀 1이 이동할 음성 채널",
     팀2_채널="팀 2가 이동할 음성 채널",
+    방식="팀 나누는 방식 (기본: 밸런스)",
 )
-@app_commands.rename(팀1_채널="팀1_채널", 팀2_채널="팀2_채널")
+@app_commands.rename(팀1_채널="팀1_채널", 팀2_채널="팀2_채널", 방식="방식")
+@app_commands.choices(방식=SPLIT_MODE_CHOICES)
 async def split_teams(
     interaction: discord.Interaction,
     팀1_채널: discord.VoiceChannel,
     팀2_채널: discord.VoiceChannel,
+    방식: Optional[app_commands.Choice[str]] = None,
 ) -> None:
     guild = interaction.guild
     if guild is None:
         raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+
+    mode = 방식.value if 방식 is not None else MODE_BALANCE
 
     user = interaction.user
     voice_state = getattr(user, "voice", None)          # 서버 밖(DM)에서는 None
@@ -537,24 +1514,39 @@ async def split_teams(
     ensure_can_move(guild, lobby, 팀1_채널, 팀2_채널)
     await interaction.response.defer()
 
-    team1, team2 = split_two(participants)
-    moved1, failed1 = await move_members(team1, 팀1_채널)
-    moved2, failed2 = await move_members(team2, 팀2_채널)
+    players = [bot.store.ensure_player(guild.id, member.id, member.display_name) for member in participants]
+    bot.store.save()
+    team1, team2 = split_players(players, mode)
+    member_map = {member.id: member for member in participants}
+
+    moved1, failed1 = await move_members([member_map[player.member_id] for player in team1], 팀1_채널)
+    moved2, failed2 = await move_members([member_map[player.member_id] for player in team2], 팀2_채널)
     all_failed = failed1 + failed2
 
-    embed = build_result_embed(
-        moved1,
-        moved2,
-        description=f"**{lobby.name}** 에 모인 {len(participants)}명을 무작위로 나눠 이동시켰어요.",
-        footer_extra=f"실패 {len(all_failed)}명" if all_failed else "",
+    description = (
+        f"**{lobby.name}** 에 모인 {len(participants)}명을 **{MODE_LABELS[mode]}** 방식으로 나눴어요."
+    )
+    if mode == MODE_BALANCE:
+        gap = abs(team_average(team1) - team_average(team2))
+        description += f"\n팀 평균 점수 차이는 **{gap:.0f}점** 이에요."
+
+    embed = build_split_embed(
+        team1,
+        team2,
+        mode=mode,
+        description=description,
+        failed=len(all_failed),
     )
     view = SplitResultView(
+        bot_=bot,
         author_id=user.id,
         guild=guild,
         lobby=lobby,
         team1_channel=팀1_채널,
         team2_channel=팀2_채널,
-        participants=participants,
+        mode=mode,
+        team1=team1,
+        team2=team2,
     )
     message = await interaction.followup.send(embed=embed, view=view)
     view.message = message
@@ -638,6 +1630,137 @@ async def gather_members(
         )
     embed.set_footer(text="다시 나누려면 /팀나누기 를 실행해 주세요.")
     await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /점수설정
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(name="점수설정", description="특정 멤버의 내전 점수를 직접 정해요. (0~5000)")
+@app_commands.guild_only()
+@app_commands.describe(멤버="점수를 바꿀 멤버", 점수="새 점수 (0~5000)")
+@app_commands.rename(멤버="멤버", 점수="점수")
+async def set_score_command(
+    interaction: discord.Interaction,
+    멤버: discord.Member,
+    점수: app_commands.Range[int, MIN_SCORE, MAX_SET_SCORE],
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+    ensure_score_manager(interaction)
+    if 멤버.bot:
+        raise TeamBotError("봇에게는 점수를 줄 수 없어요.")
+
+    await interaction.response.defer(ephemeral=True)
+    before, after = bot.store.set_score(guild.id, 멤버.id, int(점수), 멤버.display_name)
+    bot.store.save()
+    await bot.sync_backup(guild.id)
+
+    change = ""
+    if before != after:
+        change = f" ({before}점 → **{after}점**, {after - before:+d})"
+    else:
+        change = f" ({after}점 그대로)"
+    await interaction.followup.send(
+        f"✅ {멤버.display_name} 님의 점수를 **{tier_label(after)} {after}점** 으로 설정했어요.{change}",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /점수초기화
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(name="점수초기화", description="멤버(또는 서버 전체) 점수를 1000점·0승 0패로 되돌려요.")
+@app_commands.guild_only()
+@app_commands.describe(멤버="비워 두면 서버 전체를 초기화해요")
+@app_commands.rename(멤버="멤버")
+async def reset_score_command(
+    interaction: discord.Interaction,
+    멤버: Optional[discord.Member] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+    ensure_score_manager(interaction)
+
+    await interaction.response.defer(ephemeral=True)
+    if 멤버 is not None:
+        if 멤버.bot:
+            raise TeamBotError("봇의 점수는 초기화할 필요가 없어요.")
+        bot.store.reset_member(guild.id, 멤버.id, 멤버.display_name)
+        bot.store.save()
+        await bot.sync_backup(guild.id)
+        await interaction.followup.send(
+            f"♻️ {멤버.display_name} 님을 **{DEFAULT_SCORE}점 (0승 0패)** 으로 되돌렸어요.",
+            ephemeral=True,
+        )
+        return
+
+    count = bot.store.reset_guild(guild.id)
+    bot.store.save()
+    await bot.sync_backup(guild.id)
+    await interaction.followup.send(
+        f"♻️ 서버 전체 점수를 초기화했어요. ({count}명 → {DEFAULT_SCORE}점)",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /랭킹
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(name="랭킹", description="서버 내전 순위표를 보여줘요.")
+@app_commands.guild_only()
+async def ranking_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+
+    rows = bot.store.ranking(guild.id)
+    embed = build_ranking_embed(guild.name, rows, total=len(rows))
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /기록채널
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(name="기록채널", description="점수 백업용 텍스트 채널을 지정해요. (새 채널을 만들 필요는 없어요)")
+@app_commands.guild_only()
+@app_commands.describe(채널="점수 JSON 백업 메시지를 남길 텍스트 채널")
+@app_commands.rename(채널="채널")
+async def set_record_channel_command(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+    ensure_score_manager(interaction)
+
+    me = guild.me
+    permissions = 채널.permissions_for(me) if me is not None else None
+    if permissions is not None and not (permissions.send_messages and permissions.read_message_history):
+        raise TeamBotError(
+            f"**{채널.name}** 채널에서 봇이 메시지를 보내거나 읽을 권한이 없어요.\n"
+            "채널 설정 → 권한에서 봇 역할의 **'메시지 보내기'**, **'채널 기록 읽기'** 를 허용해 주세요."
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    bot.store.set_record_channel(guild.id, 채널.id)
+    bot.store.save()
+    await bot.sync_backup(guild.id)
+    await interaction.followup.send(
+        f"✅ 점수 기록 채널을 **{채널.name}** 로 정했어요.\n"
+        "이 채널의 JSON 백업 메시지로 봇이 재시작해도 점수가 복구돼요.",
+        ephemeral=True,
+    )
 
 
 # ---------------------------------------------------------------------------
