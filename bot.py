@@ -863,7 +863,7 @@ async def read_backup_channel(
             contents[message.id] = message.content
 
     try:
-        for message in await channel.pins():
+        async for message in channel.pins():
             remember(message)
     except (discord.Forbidden, discord.HTTPException):
         pass

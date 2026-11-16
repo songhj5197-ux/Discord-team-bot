@@ -490,7 +490,9 @@ class FakeTextChannel:
         return message
 
     async def pins(self):
-        return [self.messages[i] for i in self.pinned_ids if i in self.messages]
+        for message_id in list(self.pinned_ids):
+            if message_id in self.messages:
+                yield self.messages[message_id]
 
     async def history(self, limit=None):
         items = sorted(self.messages.values(), key=lambda message: message.id, reverse=True)[:limit]
