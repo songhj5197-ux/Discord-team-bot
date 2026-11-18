@@ -400,12 +400,16 @@ class FakeResponse:
     def __init__(self):
         self.messages = []
         self.deferred = False
+        self.edits = []
 
     def is_done(self):
         return self.deferred
 
     async def send_message(self, content=None, **kwargs):
         self.messages.append(content)
+
+    async def edit_message(self, **kwargs):
+        self.edits.append(kwargs)
 
     async def defer(self, **kwargs):
         self.deferred = True
@@ -420,7 +424,8 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self):
+    def __init__(self, user=None):
+        self.user = user
         self.response = FakeResponse()
         self.followup = FakeFollowup()
         self.edits = []
@@ -644,7 +649,7 @@ class ViewTests(unittest.TestCase):
 
     def test_commands_registered(self):
         names = {command.name for command in team_bot.bot.tree.get_commands()}
-        for expected in {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널"}:
+        for expected in {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표"}:
             self.assertIn(expected, names)
 
 
@@ -875,7 +880,7 @@ class _SyncGuild:
         self.name = f"서버{guild_id}"
 
 
-EXPECTED_COMMANDS = {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널"}
+EXPECTED_COMMANDS = {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표"}
 
 
 class CommandSyncBot:
@@ -937,6 +942,12 @@ class CommandSyncTests(unittest.TestCase):
         self.assertFalse(split_options["방식"]["required"])
         self.assertIn("채널", {option["name"] for option in payload_by_name["기록채널"]["options"]})
         self.assertIn("멤버", {option["name"] for option in payload_by_name["점수설정"]["options"]})
+        poll_options = {option["name"]: option for option in payload_by_name["투표"]["options"]}
+        self.assertEqual(set(poll_options), {"제목", "보기", "중복선택"})
+        self.assertTrue(poll_options["제목"]["required"])
+        self.assertTrue(poll_options["보기"]["required"])
+        self.assertFalse(poll_options["중복선택"]["required"], "중복선택은 기본값이 있는 선택 항목이어야 해요")
+        self.assertTrue(poll_options["중복선택"]["description"])
 
     def test_globals_cleared_once_and_memory_kept_for_later_copy(self):
         asyncio_run(self.bot.sync_commands_to_guilds())
@@ -982,6 +993,284 @@ class CommandSyncTests(unittest.TestCase):
         self.assertEqual(names, EXPECTED_COMMANDS)
         # 전역에도 그대로 남아 있어 두 곳에서 중복 등록되지 않습니다.
         self.assertEqual(len(self.bot.tree.get_commands(guild=None)), len(EXPECTED_COMMANDS))
+
+
+class FakePollUser:
+    """투표를 누르는 가짜 사용자."""
+
+    def __init__(self, user_id, name, *, move_members=False, bot=False):
+        self.id = user_id
+        self.display_name = name
+        self.bot = bot
+        self.guild_permissions = FakeVoicePermissions(move_members)
+
+
+def _poll_view(*, multi=True, options=None, author_id=1):
+    state = team_bot.PollState(
+        title="오늘 내전 몇 시?",
+        options=list(options or ["9시", "10시", "11시", "불참"]),
+        multi=multi,
+        author_id=author_id,
+    )
+    return team_bot.PollView(state)
+
+
+def _poll_buttons(view):
+    return {child.custom_id.rsplit(":", 1)[-1]: child for child in view.children}
+
+
+class PollParseTests(unittest.TestCase):
+    def test_trims_spaces_and_drops_empties(self):
+        self.assertEqual(
+            team_bot.parse_poll_options(" 9시 , 10시 ,, 11시 , 불참, "),
+            ["9시", "10시", "11시", "불참"],
+        )
+
+    def test_fullwidth_and_korean_commas(self):
+        self.assertEqual(team_bot.parse_poll_options("9시，10시、11시"), ["9시", "10시", "11시"])
+
+    def test_duplicates_removed_in_order(self):
+        self.assertEqual(team_bot.parse_poll_options("9시, 10시, 9시"), ["9시", "10시"])
+
+    def test_requires_two_options(self):
+        for raw in ("", "   ", "9시", "9시, , ", "9시, 9시"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(team_bot.TeamBotError) as caught:
+                    team_bot.parse_poll_options(raw)
+                self.assertIn("2개 이상", str(caught.exception))
+
+    def test_max_twenty_options(self):
+        self.assertEqual(len(team_bot.parse_poll_options(", ".join(f"{i}시" for i in range(20)))), 20)
+        with self.assertRaises(team_bot.TeamBotError) as caught:
+            team_bot.parse_poll_options(", ".join(f"{i}시" for i in range(21)))
+        self.assertIn("20개", str(caught.exception))
+
+
+class PollStateTests(unittest.TestCase):
+    def _state(self, multi=True):
+        return team_bot.PollState(title="오늘 내전 몇 시?", options=["9시", "10시", "11시"], multi=multi, author_id=1)
+
+    def test_multi_choice_toggle(self):
+        state = self._state()
+        self.assertTrue(state.toggle(10, "가", 0))
+        self.assertTrue(state.toggle(10, "가", 2), "중복 선택 모드에서는 여러 보기를 동시에 고를 수 있어요")
+        self.assertEqual((state.count(0), state.count(2)), (1, 1))
+        self.assertEqual(state.total_voters(), 1)
+
+        self.assertFalse(state.toggle(10, "가", 0), "이미 누른 보기를 다시 누르면 취소돼야 해요")
+        self.assertEqual((state.count(0), state.count(2)), (0, 1))
+        self.assertEqual(state.total_voters(), 1)
+        self.assertFalse(state.toggle(10, "가", 2))
+        self.assertEqual(state.total_voters(), 0)
+
+    def test_single_choice_moves_vote(self):
+        state = self._state(multi=False)
+        state.toggle(10, "가", 0)
+        state.toggle(10, "가", 1)
+        self.assertEqual([state.count(i) for i in range(3)], [0, 1, 0])
+        self.assertEqual(state.voter_ids(1), [10])
+        self.assertEqual(state.total_voters(), 1)
+        state.toggle(10, "가", 1)
+        self.assertEqual(state.total_voters(), 0)
+
+    def test_voter_names_keep_vote_order(self):
+        state = self._state()
+        state.toggle(10, "가", 0)
+        state.toggle(11, "나", 0)
+        state.toggle(12, "다", 0)
+        self.assertEqual(state.voter_names(0), ["가", "나", "다"])
+
+    def test_winners_and_tie(self):
+        state = self._state()
+        self.assertEqual(state.winners(), [], "0표만 있으면 최다 득표가 없어요")
+        state.toggle(10, "가", 0)
+        state.toggle(11, "나", 1)
+        self.assertEqual(sorted(state.winners()), [0, 1])
+        state.toggle(12, "다", 1)
+        self.assertEqual(state.winners(), [1])
+
+    def test_closed_poll_rejects_votes(self):
+        state = self._state()
+        self.assertTrue(state.close())
+        self.assertFalse(state.close(), "이미 마감한 투표는 다시 마감되지 않아요")
+        with self.assertRaises(team_bot.TeamBotError):
+            state.toggle(10, "가", 0)
+
+    def test_bad_option_index(self):
+        state = self._state()
+        with self.assertRaises(team_bot.TeamBotError):
+            state.toggle(10, "가", 3)
+
+
+class PollEmbedTests(unittest.TestCase):
+    def _state(self):
+        state = team_bot.PollState(title="오늘 내전 몇 시?", options=["9시", "10시", "불참"], author_id=1)
+        state.toggle(10, "가", 0)
+        state.toggle(11, "나", 0)
+        state.toggle(12, "다", 2)
+        return state
+
+    def test_live_embed_shows_counts_and_names(self):
+        embed = team_bot.build_poll_embed(self._state())
+        self.assertIn("오늘 내전 몇 시?", embed.title)
+        self.assertIn("동시에", embed.description)
+        self.assertEqual([field.name for field in embed.fields], ["9시 — 2표", "10시 — 0표", "불참 — 1표"])
+        self.assertEqual(embed.fields[0].value, "가, 나")
+        self.assertEqual(embed.fields[1].value, "아직 없음")
+        self.assertIn("투표한 사람 3명", embed.footer.text)
+        self.assertIn("중복 선택 가능", embed.footer.text)
+        self.assertFalse(any("🏆" in field.name for field in embed.fields), "마감 전에는 강조하지 않아요")
+
+    def test_single_choice_embed_notice(self):
+        state = self._state()
+        state.multi = False
+        embed = team_bot.build_poll_embed(state)
+        self.assertIn("1인 1표", embed.description)
+        self.assertIn("1인 1표", embed.footer.text)
+
+    def test_closed_embed_highlights_winner(self):
+        state = self._state()
+        state.close()
+        embed = team_bot.build_poll_embed(state)
+        self.assertIn("마감", embed.description)
+        self.assertIn("🏆 최다 득표: **9시** (2표)", embed.description)
+        self.assertTrue(embed.fields[0].name.startswith("🏆 9시"))
+        self.assertFalse(embed.fields[2].name.startswith("🏆"))
+        self.assertIn("마감됨", embed.footer.text)
+
+    def test_closed_embed_without_votes(self):
+        state = team_bot.PollState(title="제목", options=["a", "b"], author_id=1)
+        state.close()
+        embed = team_bot.build_poll_embed(state)
+        self.assertIn("아무도 투표하지 않았어요", embed.description)
+
+    def test_many_voters_are_not_truncated_by_embed_limit(self):
+        state = team_bot.PollState(title="제목", options=["a", "b"], author_id=1)
+        for index in range(300):
+            state.toggle(1000 + index, f"참가자{index}", 0)
+        embed = team_bot.build_poll_embed(state)
+        self.assertLessEqual(len(embed.fields[0].value), 1024)
+        self.assertIn("외", embed.fields[0].value)
+
+
+class PollViewTests(unittest.TestCase):
+    def test_timeout_is_seven_days(self):
+        self.assertEqual(team_bot.POLL_BUTTON_TIMEOUT, 60 * 60 * 24 * 7)
+        self.assertEqual(_poll_view().timeout, 60 * 60 * 24 * 7)
+
+    def test_button_layout_and_labels(self):
+        view = _poll_view()
+        self.assertEqual([child.row for child in view.children], [0, 0, 0, 0, 1])
+        labels = [child.label for child in view.children]
+        self.assertEqual(labels[:4], ["9시 (0)", "10시 (0)", "11시 (0)", "불참 (0)"])
+        self.assertEqual(labels[4], "투표 마감")
+        close = _poll_buttons(view)["close"]
+        self.assertTrue(close.disabled is False)
+        self.assertEqual(close.custom_id, f"team_bot:poll:{view.state.poll_id}:close")
+
+    def test_twenty_options_fit_in_five_rows(self):
+        view = _poll_view(options=[f"{i}시" for i in range(20)])
+        self.assertEqual(len(view.children), 21)
+        self.assertEqual([child.row for child in view.children], [0] * 5 + [1] * 5 + [2] * 5 + [3] * 5 + [4])
+        for child in view.children:
+            self.assertLessEqual(len(child.label), team_bot.POLL_LABEL_LIMIT)
+            self.assertLessEqual(len(child.custom_id), 100)
+
+    def test_long_option_label_is_truncated(self):
+        view = _poll_view(options=["가" * 200, "짧은 보기"])
+        self.assertLessEqual(len(view.children[0].label), team_bot.POLL_LABEL_LIMIT)
+        self.assertTrue(view.children[0].label.endswith("… (0)"))
+
+    def test_vote_updates_message_and_label(self):
+        view = _poll_view()
+        user = FakePollUser(10, "가")
+        interaction = FakeInteraction(user)
+
+        asyncio_run(view.handle_vote(interaction, 0))
+        self.assertEqual(view.state.count(0), 1)
+        self.assertTrue(interaction.response.edits, "투표하면 메시지가 바로 갱신돼야 해요")
+        embed = interaction.response.edits[0]["embed"]
+        self.assertEqual(embed.fields[0].value, "가")
+        self.assertEqual(view.children[0].label, "9시 (1)")
+
+        # 같은 보기를 다시 누르면 취소 (토글)
+        asyncio_run(view.handle_vote(FakeInteraction(user), 0))
+        self.assertEqual(view.state.count(0), 0)
+        self.assertEqual(view.children[0].label, "9시 (0)")
+
+    def test_multi_choice_two_buttons_at_once(self):
+        view = _poll_view()
+        user = FakePollUser(10, "가")
+        asyncio_run(view.handle_vote(FakeInteraction(user), 0))
+        asyncio_run(view.handle_vote(FakeInteraction(user), 2))
+        self.assertEqual([view.state.count(i) for i in range(4)], [1, 0, 1, 0])
+        self.assertEqual(view.children[0].style, team_bot.discord.ButtonStyle.success)
+        self.assertEqual(view.children[1].style, team_bot.discord.ButtonStyle.secondary)
+
+    def test_single_choice_mode_replaces_vote(self):
+        view = _poll_view(multi=False)
+        user = FakePollUser(10, "가")
+        asyncio_run(view.handle_vote(FakeInteraction(user), 0))
+        asyncio_run(view.handle_vote(FakeInteraction(user), 1))
+        self.assertEqual([view.state.count(i) for i in range(4)], [0, 1, 0, 0])
+        self.assertEqual(view.children[0].label, "9시 (0)")
+        self.assertEqual(view.children[1].label, "10시 (1)")
+
+    def test_bot_cannot_vote(self):
+        view = _poll_view()
+        interaction = FakeInteraction(FakePollUser(99, "봇", bot=True))
+        asyncio_run(view.handle_vote(interaction, 0))
+        self.assertEqual(view.state.count(0), 0)
+        self.assertIn("봇은 투표할 수 없어요", interaction.response.messages[0])
+
+    def test_close_permissions(self):
+        view = _poll_view(author_id=1)
+        other = FakeInteraction(FakePollUser(2, "나"))
+        asyncio_run(view.handle_close(other))
+        self.assertFalse(view.state.closed)
+        self.assertIn("만든 사람", other.response.messages[0])
+
+        manager = FakeInteraction(FakePollUser(3, "관리자", move_members=True))
+        asyncio_run(view.handle_close(manager))
+        self.assertTrue(view.state.closed, "'멤버 이동' 권한자는 마감할 수 있어요")
+
+    def test_creator_can_close_and_buttons_lock(self):
+        view = _poll_view(author_id=1)
+        author = FakePollUser(1, "만든이")
+        asyncio_run(view.handle_vote(FakeInteraction(author), 1))
+
+        interaction = FakeInteraction(author)
+        asyncio_run(view.handle_close(interaction))
+
+        self.assertTrue(view.state.closed)
+        embed = interaction.response.edits[0]["embed"]
+        self.assertIn("마감", embed.description)
+        self.assertTrue(embed.fields[1].name.startswith("🏆 10시"))
+        for child in view.children:
+            self.assertTrue(child.disabled, "마감하면 모든 버튼이 잠겨야 해요")
+        self.assertEqual(view.children[-1].label, "마감됨")
+
+        # 마감 뒤 투표는 막힙니다.
+        late = FakeInteraction(FakePollUser(5, "늦은이"))
+        asyncio_run(view.handle_vote(late, 0))
+        self.assertEqual(view.state.count(0), 0)
+        self.assertIn("마감된 투표", late.response.messages[0])
+
+    def test_vote_after_timeout_disables_buttons(self):
+        view = _poll_view()
+        asyncio_run(view.on_timeout())
+        for child in view.children:
+            self.assertTrue(child.disabled)
+
+    def test_poll_command_registered_with_options(self):
+        commands = {command.name: command for command in team_bot.bot.tree.get_commands()}
+        self.assertIn("투표", commands)
+        parameters = {parameter.name: parameter for parameter in commands["투표"].parameters}
+        self.assertEqual(set(parameters), {"제목", "보기", "중복선택"})
+        self.assertTrue(parameters["제목"].required)
+        self.assertTrue(parameters["보기"].required)
+        self.assertFalse(parameters["중복선택"].required)
+        self.assertIsNone(parameters["중복선택"].default)
 
 
 if __name__ == "__main__":

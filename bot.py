@@ -13,6 +13,7 @@
     /점수초기화 [멤버]                  → 멤버(또는 서버 전체) 점수를 1000점으로
     /랭킹                              → 서버 점수 순위표
     /기록채널  채널                     → 점수 백업용 텍스트 채널 지정
+    /투표      제목 보기 [중복선택]      → 내전 날짜·시간 투표 (기본: 여러 보기 중복 선택)
 
 결과 메시지의 버튼
     🔀 다시 섞기          같은 인원을 다시 섞어 이동 (새 판으로 리셋, 라운드 스코어 0:0)
@@ -20,6 +21,14 @@
     🏆 2팀 승리         2팀 승리로 그 라운드를 정산 (누를 때마다 라운드가 쌓임)
     ↩️ 방금 정산 취소     마지막으로 정산한 라운드 1회분을 되돌림
     📢 대기방으로 모으기   두 팀 채널의 인원을 처음 대기방으로 복귀
+
+투표
+    /투표 로 만든 메시지에는 보기별 버튼이 붙고, 누를 때마다 표가 토글(추가/취소)
+    됩니다. 버튼 라벨에 득표수(예: `9시 (3)`)가 함께 보이고, 임베드에는 보기별
+    인원수와 투표한 사람 이름이 실시간으로 표시됩니다(멘션 알림 없이 이름만).
+    기본은 중복 선택 허용이고 `중복선택:아니오` 로 1인 1표 투표도 만들 수 있습니다.
+    만든 사람(또는 '멤버 이동' 권한자)이 🔒 투표 마감 을 누를 수 있고, 마감하면
+    최다 득표 보기를 🏆 로 강조한 뒤 버튼을 잠깁니다. 버튼은 7일 동안 유효합니다.
 
 점수
     새 멤버는 1000점에서 시작하고, 승리 시 +15~+35점, 패배 시 -15~-30점이
@@ -51,6 +60,7 @@ import os
 import random
 import re
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,6 +86,12 @@ GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
 GUILD_ID: Optional[int] = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else None
 
 BUTTON_TIMEOUT = 60 * 60 * 3      # 결과 버튼을 누를 수 있는 시간(초) — 4맵 내전도 넉넉하게
+POLL_BUTTON_TIMEOUT = 60 * 60 * 24 * 7   # 투표 버튼 유효시간(초) — 며칠 전부터 열어 둘 수 있게 7일
+POLL_MIN_OPTIONS = 2              # 보기 최소 개수
+POLL_MAX_OPTIONS = 20             # 보기 최대 개수 (5줄 × 5개에서 마감 버튼 자리 확보)
+POLL_LABEL_LIMIT = 80             # 디스코드 버튼 라벨 최대 글자 수
+POLL_TITLE_LIMIT = 200            # 투표 제목 최대 글자 수 (임베드 제목 256자 한도)
+POLL_ID_PREFIX = "team_bot:poll:" # 버튼 custom_id 앞부분 (최대 100자)
 MOVE_REASON = "팀 나누기 봇: 팀 이동"
 PLACEHOLDER_TOKEN = "여기에_봇_토큰_입력"
 
@@ -1720,6 +1736,382 @@ class SplitResultView(discord.ui.View):
                     "정산을 되돌리는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.", ephemeral=True
                 )
                 return
+
+
+# ---------------------------------------------------------------------------
+# 투표 (내전 날짜·시간 정하기)
+# ---------------------------------------------------------------------------
+
+POLL_SEPARATOR_RE = re.compile(r"[,，、]")
+
+
+def parse_poll_options(raw: str) -> list[str]:
+    """쉼표로 구분한 보기 문자열을 정리된 목록으로 바꿉니다.
+
+    '9시, 10시, 11시, 불참' → ['9시', '10시', '11시', '불참']
+    앞뒤 공백과 빈 항목을 없애고, 같은 보기가 두 번 나오면 뒤엣것은 버립니다.
+    보기가 2개보다 적거나 20개보다 많으면 TeamBotError 로 안내합니다.
+    """
+    options: list[str] = []
+    for part in POLL_SEPARATOR_RE.split(raw or ""):
+        text = part.strip()
+        if not text or text in options:
+            continue
+        options.append(text)
+
+    if len(options) < POLL_MIN_OPTIONS:
+        raise TeamBotError(
+            "보기를 **2개 이상** 쉼표(,)로 구분해 주세요.\n"
+            "예: `/투표 제목: 오늘 내전 몇 시? 보기: 9시, 10시, 11시, 불참`"
+        )
+    if len(options) > POLL_MAX_OPTIONS:
+        raise TeamBotError(
+            f"보기는 최대 **{POLL_MAX_OPTIONS}개** 까지만 만들 수 있어요. (지금 {len(options)}개)\n"
+            "보기를 줄여서 다시 만들어 주세요."
+        )
+    return options
+
+
+@dataclass
+class PollState:
+    """투표 한 건의 상태.
+
+    디스코드 없이도 그대로 돌려 볼 수 있도록 버튼·임베드와 분리해 둡니다.
+    표는 보기별로 `{유저ID: 표시이름}` 순서 있는 사전에 담아, 먼저 누른 사람이
+    먼저 보이게 합니다(멘션 알림이 가지 않도록 이름만 저장).
+    """
+
+    title: str
+    options: list[str]
+    multi: bool = True              # True: 중복 선택 가능, False: 1인 1표
+    author_id: int = 0              # 투표를 만든 사람 (마감 권한)
+    poll_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    closed: bool = False
+    votes: list[dict[int, str]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if len(self.votes) != len(self.options):
+            self.votes = [dict() for _ in self.options]
+
+    # -- 투표 -----------------------------------------------------------------
+    def toggle(self, user_id: int, name: str, index: int) -> bool:
+        """한 사람의 표를 토글합니다. 방금 눌러서 담겼으면 True, 취소됐으면 False."""
+        if self.closed:
+            raise TeamBotError("이미 마감된 투표예요. 새 투표를 만들어 주세요.")
+        if not 0 <= index < len(self.options):
+            raise TeamBotError("없는 보기예요. 화면을 새로 고친 뒤 다시 눌러 주세요.")
+
+        voters = self.votes[index]
+        if user_id in voters:
+            del voters[user_id]
+            return False
+
+        if not self.multi:
+            # 1인 1표: 다른 보기에 눌러 둔 표를 먼저 지웁니다.
+            for other in self.votes:
+                other.pop(user_id, None)
+        voters[user_id] = name
+        return True
+
+    def count(self, index: int) -> int:
+        return len(self.votes[index])
+
+    def voter_names(self, index: int) -> list[str]:
+        return list(self.votes[index].values())
+
+    def voter_ids(self, index: int) -> list[int]:
+        return list(self.votes[index].keys())
+
+    def total_voters(self) -> int:
+        """서로 다른 사람이 몇 명 투표했는지."""
+        return len({user_id for voters in self.votes for user_id in voters})
+
+    def winners(self) -> list[int]:
+        """가장 많은 표를 받은 보기들 (0표면 빈 목록, 동률이면 여러 개)."""
+        best = max((self.count(index) for index in range(len(self.options))), default=0)
+        if best == 0:
+            return []
+        return [index for index in range(len(self.options)) if self.count(index) == best]
+
+    def close(self) -> bool:
+        """투표를 마감합니다. 이미 마감됐으면 False."""
+        if self.closed:
+            return False
+        self.closed = True
+        return True
+
+
+def poll_mode_text(state: PollState) -> str:
+    if state.multi:
+        return "여러 보기를 **동시에** 고를 수 있어요. 누른 보기를 다시 누르면 취소돼요."
+    return "**1인 1표**예요. 다른 보기를 누르면 표가 그쪽으로 옮겨가요."
+
+
+def poll_button_label(state: PollState, index: int) -> str:
+    """'9시 (3)' 처럼 득표수를 붙인 버튼 라벨 (디스코드 80자 제한)."""
+    suffix = f" ({state.count(index)})"
+    text = state.options[index]
+    room = POLL_LABEL_LIMIT - len(suffix) - 1      # 1은 말줄임표 자리
+    if len(text) > room:
+        text = text[:max(0, room)] + "…"
+    return f"{text}{suffix}"
+
+
+def _poll_field_value(names: Sequence[str], limit: int = 1024) -> str:
+    """투표한 사람 이름을 한 줄로 (임베드 필드 1024자 한도 안에서).
+
+    이름이 아주 많아도 잘리지 않고 '… 외 N명' 으로 남깁니다.
+    """
+    if not names:
+        return "아직 없음"
+    value = ""
+    for position, name in enumerate(names):
+        candidate = f"{value}, {name}" if value else name
+        if len(candidate) > limit - 20:
+            return f"{value}, … 외 {len(names) - position}명"
+        value = candidate
+    return value
+
+
+def build_poll_embed(state: PollState) -> discord.Embed:
+    """투표 현황 임베드 (보기별 인원수 + 투표한 사람 이름, 마감 시 최다 득표 강조)."""
+    title = state.title if len(state.title) <= POLL_TITLE_LIMIT else state.title[:POLL_TITLE_LIMIT - 1] + "…"
+    winners = set(state.winners()) if state.closed else set()
+
+    if state.closed:
+        if winners:
+            if len(winners) == len(state.options):
+                result = "모든 보기가 같은 표를 받았어요."
+            else:
+                best = max(state.count(index) for index in winners)
+                names = ", ".join(f"**{state.options[index]}**" for index in sorted(winners))
+                result = f"🏆 최다 득표: {names} ({best}표)"
+        else:
+            result = "아무도 투표하지 않았어요."
+        description = f"🔒 **투표가 마감됐어요.**\n{result}"
+    else:
+        description = (
+            f"{poll_mode_text(state)}\n"
+            "보기 버튼을 누르면 바로 반영돼요. 마감하려면 만든 사람이 **🔒 투표 마감** 을 눌러 주세요."
+        )
+
+    embed = discord.Embed(
+        title=f"🗳️ {title}",
+        description=description,
+        colour=discord.Colour.gold() if state.closed else discord.Colour.blurple(),
+    )
+
+    for index, option in enumerate(state.options):
+        name = option if len(option) <= 200 else option[:200] + "…"
+        if index in winners:
+            name = f"🏆 {name}"
+        embed.add_field(
+            name=f"{name} — {state.count(index)}표",
+            value=_poll_field_value(state.voter_names(index)),
+            inline=True,
+        )
+
+    footer = f"투표한 사람 {state.total_voters()}명"
+    if state.closed:
+        footer += " · 마감됨"
+    else:
+        footer += " · " + ("중복 선택 가능" if state.multi else "1인 1표")
+    embed.set_footer(text=footer)
+    return embed
+
+
+class PollView(discord.ui.View):
+    """실시간 투표 버튼들.
+
+    보기 버튼은 5개씩 한 줄(최대 20개 → 4줄)에 놓고, 마지막 줄에 **🔒 투표 마감** 을
+    둡니다. 디스코드 뷰 최대 수명(15분)보다 훨씬 긴 7일(`POLL_BUTTON_TIMEOUT`) 동안
+    열어 두어, 며칠 전부터 날짜·시간을 모을 수 있게 했습니다.
+    """
+
+    def __init__(
+        self,
+        state: PollState,
+        *,
+        author_id: Optional[int] = None,
+        timeout: float = POLL_BUTTON_TIMEOUT,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.state = state
+        self.author_id = state.author_id if author_id is None else author_id
+        self.message: Optional[discord.Message] = None
+        self._vote_buttons: dict[int, discord.ui.Button] = {}
+        self._close_button: Optional[discord.ui.Button] = None
+        self._build_children()
+
+    # -- 버튼 구성 -----------------------------------------------------------
+    def _build_children(self) -> None:
+        self.clear_items()
+        self._vote_buttons = {}
+
+        for index in range(len(self.state.options)):
+            button = discord.ui.Button(
+                label=poll_button_label(self.state, index),
+                style=discord.ButtonStyle.secondary,
+                row=index // 5,
+                custom_id=f"{POLL_ID_PREFIX}{self.state.poll_id}:{index}",
+            )
+            button.callback = self._vote_callback(index)
+            self._vote_buttons[index] = button
+            self.add_item(button)
+
+        close_row = min(4, (len(self.state.options) - 1) // 5 + 1)
+        close = discord.ui.Button(
+            label="투표 마감",
+            emoji="🔒",
+            style=discord.ButtonStyle.danger,
+            row=close_row,
+            custom_id=f"{POLL_ID_PREFIX}{self.state.poll_id}:close",
+        )
+        close.callback = self._close_callback
+        self._close_button = close
+        self.add_item(close)
+        self.refresh_buttons()
+
+    def refresh_buttons(self) -> None:
+        """득표수·색·마감 상태를 지금 투표 상태에 맞춥니다."""
+        for index, button in self._vote_buttons.items():
+            button.label = poll_button_label(self.state, index)
+            button.style = (
+                discord.ButtonStyle.success if self.state.count(index) else discord.ButtonStyle.secondary
+            )
+            button.disabled = self.state.closed
+        if self._close_button is not None:
+            self._close_button.disabled = self.state.closed
+            self._close_button.label = "마감됨" if self.state.closed else "투표 마감"
+
+    # -- 도우미 ---------------------------------------------------------------
+    @staticmethod
+    async def _notice(interaction: discord.Interaction, message: str) -> None:
+        """나만 보이는 안내 (이미 응답했으면 followup 으로)."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            LOG.warning("투표 안내 메시지를 보내지 못했어요")
+
+    async def _refresh_message(self, interaction: discord.Interaction) -> None:
+        self.refresh_buttons()
+        try:
+            await interaction.response.edit_message(embed=build_poll_embed(self.state), view=self)
+        except discord.HTTPException:
+            LOG.warning("투표 메시지를 갱신하지 못했어요")
+
+    def can_close(self, user: Any) -> bool:
+        """투표를 만든 사람이거나 '멤버 이동' 권한이 있으면 마감할 수 있습니다."""
+        if user is None:
+            return False
+        if getattr(user, "id", None) == self.author_id:
+            return True
+        permissions = getattr(user, "guild_permissions", None)
+        return bool(permissions is not None and getattr(permissions, "move_members", False))
+
+    # -- 버튼: 보기 투표 ------------------------------------------------------
+    def _vote_callback(self, index: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            await self.handle_vote(interaction, index)
+
+        return callback
+
+    async def handle_vote(self, interaction: discord.Interaction, index: int) -> None:
+        """누를 때마다 그 보기에 표를 더하거나(없던 표면) 뺍니다."""
+        user = getattr(interaction, "user", None)
+        if user is None or getattr(user, "bot", False):
+            await self._notice(interaction, "봇은 투표할 수 없어요.")
+            return
+        try:
+            self.state.toggle(
+                int(user.id), str(getattr(user, "display_name", None) or user.id), index
+            )
+        except TeamBotError as error:
+            await self._notice(interaction, str(error))
+            return
+        except Exception:
+            LOG.exception("투표 처리 중 오류")
+            await self._notice(interaction, "투표를 반영하지 못했어요. 잠시 후 다시 눌러 주세요.")
+            return
+        await self._refresh_message(interaction)
+
+    # -- 버튼: 투표 마감 ------------------------------------------------------
+    async def _close_callback(self, interaction: discord.Interaction) -> None:
+        await self.handle_close(interaction)
+
+    async def handle_close(self, interaction: discord.Interaction) -> None:
+        if self.state.closed:
+            await self._notice(interaction, "이미 마감된 투표예요. 새로 `/투표` 를 만들어 주세요.")
+            return
+        if not self.can_close(getattr(interaction, "user", None)):
+            await self._notice(
+                interaction,
+                "투표를 만든 사람이나 **'멤버 이동'** 권한이 있는 사람만 마감할 수 있어요.",
+            )
+            return
+        self.state.close()
+        await self._refresh_message(interaction)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# /투표
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(
+    name="투표",
+    description="내전 날짜·시간을 보기 버튼으로 투표해요. (기본: 여러 보기 중복 선택)",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    제목="투표 제목 (예: 오늘 내전 몇 시?)",
+    보기="쉼표(,)로 구분한 보기 2~20개 (예: 9시, 10시, 11시, 불참)",
+    중복선택="여러 보기를 동시에 고를 수 있게 할지 (기본: 예)",
+)
+@app_commands.rename(제목="제목", 보기="보기", 중복선택="중복선택")
+async def poll_command(
+    interaction: discord.Interaction,
+    제목: str,
+    보기: str,
+    중복선택: Optional[bool] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+
+    title = (제목 or "").strip()
+    if not title:
+        raise TeamBotError("투표 제목을 적어 주세요. (예: `오늘 내전 몇 시?`)")
+    if len(title) > POLL_TITLE_LIMIT:
+        raise TeamBotError(f"제목은 **{POLL_TITLE_LIMIT}자** 까지 적을 수 있어요. (지금 {len(title)}자)")
+
+    options = parse_poll_options(보기)
+    state = PollState(
+        title=title,
+        options=options,
+        multi=True if 중복선택 is None else bool(중복선택),
+        author_id=interaction.user.id,
+    )
+    view = PollView(state, author_id=interaction.user.id)
+    await interaction.response.send_message(embed=build_poll_embed(state), view=view)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:      # 메시지 참조를 못 얻어도 투표는 계속 동작합니다
+        LOG.debug("투표 메시지 참조를 가져오지 못했어요")
+
 
 # ---------------------------------------------------------------------------
 # /팀나누기
