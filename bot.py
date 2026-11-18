@@ -13,7 +13,8 @@
     /점수초기화 [멤버]                  → 멤버(또는 서버 전체) 점수를 1000점으로
     /랭킹                              → 서버 점수 순위표
     /기록채널  채널                     → 점수 백업용 텍스트 채널 지정
-    /투표      제목 보기 [중복선택]      → 내전 날짜·시간 투표 (기본: 여러 보기 중복 선택)
+    /투표      제목 보기 [중복선택] [정원] → 내전 날짜·시간 투표 (기본: 여러 보기 중복 선택)
+    /명단팀짜기 명단 [방식]              → 음성방 이동 없이 텍스트 명단으로 두 팀 나누기
 
 결과 메시지의 버튼
     🔀 다시 섞기          같은 인원을 다시 섞어 이동 (새 판으로 리셋, 라운드 스코어 0:0)
@@ -29,6 +30,16 @@
     기본은 중복 선택 허용이고 `중복선택:아니오` 로 1인 1표 투표도 만들 수 있습니다.
     만든 사람(또는 '멤버 이동' 권한자)이 🔒 투표 마감 을 누를 수 있고, 마감하면
     최다 득표 보기를 🏆 로 강조한 뒤 버튼을 잠깁니다. 버튼은 7일 동안 유효합니다.
+
+    `정원`(1~100)을 정하면 보기마다 먼저 누른 순서대로 정원까지는 확정(참여),
+    그 뒤로는 대기자(대기 1, 대기 2 …)가 됩니다. 확정 인원이 표를 빼면
+    대기 1번이 자동으로 확정으로 올라옵니다. 정원을 비우면 예전과 같이 동작합니다.
+
+명단 팀짜기
+    /명단팀짜기 는 음성 채널에 들어가지 않아도, 쉼표나 줄바꿈으로 적은 명단만으로
+    두 팀을 나눠 줍니다. `소현 1티어`, `현수 플레`, `철수 1200` 처럼 이름 뒤에
+    1~5티어·롤식 티어(아이언~챌린저)·숫자 점수를 붙이면 그 실력대로 밸런스를 맞추고,
+    아무것도 없으면 무작위로 반반 나눕니다. 결과 메시지의 🔀 다시 섞기 로 재조합합니다.
 
 점수
     새 멤버는 1000점에서 시작하고, 승리 시 +15~+35점, 패배 시 -15~-30점이
@@ -91,6 +102,7 @@ POLL_MIN_OPTIONS = 2              # 보기 최소 개수
 POLL_MAX_OPTIONS = 20             # 보기 최대 개수 (5줄 × 5개에서 마감 버튼 자리 확보)
 POLL_LABEL_LIMIT = 80             # 디스코드 버튼 라벨 최대 글자 수
 POLL_TITLE_LIMIT = 200            # 투표 제목 최대 글자 수 (임베드 제목 256자 한도)
+POLL_CAPACITY_MAX = 100           # /투표 정원 상한
 POLL_ID_PREFIX = "team_bot:poll:" # 버튼 custom_id 앞부분 (최대 100자)
 MOVE_REASON = "팀 나누기 봇: 팀 이동"
 PLACEHOLDER_TOKEN = "여기에_봇_토큰_입력"
@@ -119,6 +131,45 @@ TIER_TABLE: tuple[tuple[int, str, str], ...] = (
 MODE_BALANCE = "balance"
 MODE_RANDOM = "random"
 MODE_LABELS = {MODE_BALANCE: "밸런스", MODE_RANDOM: "무작위"}
+
+# -- 명단 팀짜기 -------------------------------------------------------------
+ROSTER_MODE_AUTO = "auto"
+ROSTER_MODE_LABELS = {ROSTER_MODE_AUTO: "자동", MODE_BALANCE: "밸런스", MODE_RANDOM: "무작위"}
+ROSTER_MIN_MEMBERS = 2            # /명단팀짜기 최소 인원
+ROSTER_MAX_MEMBERS = 100          # /명단팀짜기 최대 인원
+ROSTER_NAME_LIMIT = 40            # 한 사람 이름 최대 글자 수
+ROSTER_MAX_SCORE = 99999          # 숫자 점수 상한
+# 1티어가 가장 높은 내부 점수 (1티어끼리 한 팀에 몰리지 않게)
+ROSTER_TIER_SCORES: dict[int, int] = {1: 1500, 2: 1350, 3: 1200, 4: 1000, 5: 850}
+# 롤식 티어의 기본 점수 (단계 숫자가 붙으면 아래 보너스를 더함)
+ROLE_TIER_BASE: dict[str, int] = {
+    "챌린저": 1600,
+    "그랜드마스터": 1550,
+    "마스터": 1500,
+    "다이아": 1425,
+    "에메랄드": 1350,
+    "플래티넘": 1275,
+    "골드": 1200,
+    "실버": 1125,
+    "브론즈": 1050,
+    "아이언": 950,
+}
+# '다이아1' 처럼 단계 숫자를 붙였을 때 더하는 점수 (1단계가 그 티어에서 가장 높음)
+ROSTER_STAGE_BONUS: dict[int, int] = {1: 30, 2: 20, 3: 10, 4: 0}
+ROLE_ALIASES: dict[str, str] = {
+    "챌린저": "챌린저", "챌": "챌린저",
+    "그랜드마스터": "그랜드마스터", "그랜드": "그랜드마스터", "그마": "그랜드마스터", "그": "그랜드마스터",
+    "마스터": "마스터", "마": "마스터",
+    "다이아": "다이아", "다이아몬드": "다이아", "다": "다이아",
+    "에메랄드": "에메랄드", "에메": "에메랄드", "에": "에메랄드",
+    "플래티넘": "플래티넘", "플래": "플래티넘", "플레": "플래티넘", "플": "플래티넘",
+    "골드": "골드", "골": "골드",
+    "실버": "실버", "실": "실버",
+    "브론즈": "브론즈", "브": "브론즈",
+    "아이언": "아이언",
+}
+ROSTER_SEGMENT_RE = re.compile(r"[,，、\n\r]+")          # 참가자 구분
+ROSTER_TOKEN_RE = re.compile(r"[\s:/|·\-–—]+")            # 이름과 티어 사이 구분자
 
 # -- 저장 / 백업 -------------------------------------------------------------
 SCORE_FILE = os.getenv("SCORE_FILE", "").strip() or os.path.join(
@@ -1785,6 +1836,7 @@ class PollState:
     options: list[str]
     multi: bool = True              # True: 중복 선택 가능, False: 1인 1표
     author_id: int = 0              # 투표를 만든 사람 (마감 권한)
+    capacity: int = 0               # 보기별 확정 인원 (0이면 제한 없음)
     poll_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     closed: bool = False
     votes: list[dict[int, str]] = field(default_factory=list)
@@ -1815,6 +1867,31 @@ class PollState:
 
     def count(self, index: int) -> int:
         return len(self.votes[index])
+
+    # -- 정원 / 대기자 -------------------------------------------------------
+    def confirmed_count(self, index: int) -> int:
+        """정원 안에 들어간(확정) 인원. 정원이 없으면 전체 인원."""
+        total = self.count(index)
+        return total if self.capacity <= 0 else min(total, self.capacity)
+
+    def waiting_count(self, index: int) -> int:
+        """정원이 차서 대기 중인 인원."""
+        if self.capacity <= 0:
+            return 0
+        return max(0, self.count(index) - self.capacity)
+
+    def confirmed_names(self, index: int) -> list[str]:
+        names = self.voter_names(index)
+        return names if self.capacity <= 0 else names[: self.capacity]
+
+    def waiting_names(self, index: int) -> list[str]:
+        """대기자 이름 (먼저 누른 순서 = 대기 1, 대기 2 …)."""
+        if self.capacity <= 0:
+            return []
+        return self.voter_names(index)[self.capacity:]
+
+    def is_full(self, index: int) -> bool:
+        return self.capacity > 0 and self.count(index) >= self.capacity
 
     def voter_names(self, index: int) -> list[str]:
         return list(self.votes[index].values())
@@ -1847,11 +1924,30 @@ def poll_mode_text(state: PollState) -> str:
     return "**1인 1표**예요. 다른 보기를 누르면 표가 그쪽으로 옮겨가요."
 
 
+def poll_capacity_text(state: PollState) -> str:
+    """정원이 있을 때 임베드 설명에 넣는 안내."""
+    return (
+        f"보기마다 **정원 {state.capacity}명**이에요. 먼저 누른 순서대로 정원까지는 **확정(참여)**, "
+        "그 뒤로는 **대기자**가 돼요. 확정 인원이 표를 빼면 대기 1번이 자동으로 올라와요."
+    )
+
+
+def _poll_count_suffix(state: PollState, index: int) -> str:
+    """' (3)' 또는 ' (10/10)' / ' (10/10 · 대기 2)' — 버튼·필드에 붙는 현황."""
+    if state.capacity <= 0:
+        return f" ({state.count(index)})"
+    suffix = f" ({state.confirmed_count(index)}/{state.capacity}"
+    waiting = state.waiting_count(index)
+    if waiting:
+        suffix += f" · 대기 {waiting}"
+    return suffix + ")"
+
+
 def poll_button_label(state: PollState, index: int) -> str:
-    """'9시 (3)' 처럼 득표수를 붙인 버튼 라벨 (디스코드 80자 제한)."""
-    suffix = f" ({state.count(index)})"
-    text = state.options[index]
+    """'9시 (3)' / '9시 (10/10 · 대기 2)' 처럼 현황을 붙인 버튼 라벨 (80자 제한)."""
+    suffix = _poll_count_suffix(state, index)
     room = POLL_LABEL_LIMIT - len(suffix) - 1      # 1은 말줄임표 자리
+    text = state.options[index]
     if len(text) > room:
         text = text[:max(0, room)] + "…"
     return f"{text}{suffix}"
@@ -1873,6 +1969,29 @@ def _poll_field_value(names: Sequence[str], limit: int = 1024) -> str:
     return value
 
 
+def _poll_waiting_value(names: Sequence[str], limit: int = 1024) -> str:
+    """대기자를 '1. 다, 2. 라' 처럼 번호와 함께 남깁니다."""
+    if not names:
+        return "없음"
+    numbered = [f"{position}. {name}" for position, name in enumerate(names, start=1)]
+    return _poll_field_value(numbered, limit)
+
+
+def _poll_field_value_with_capacity(state: PollState, index: int) -> str:
+    """정원이 있을 때: 확정 인원과 대기자를 구분해서 보여 줍니다."""
+    confirmed = state.confirmed_names(index)
+    value = (
+        f"✅ 확정 {len(confirmed)}/{state.capacity} — "
+        f"{_poll_field_value(confirmed, limit=500)}"
+    )
+    waiting = state.waiting_names(index)
+    if waiting:
+        value += f"\n⏳ 대기 {len(waiting)} — {_poll_waiting_value(waiting, limit=500)}"
+    else:
+        value += "\n⏳ 대기 0 — 없음"
+    return value
+
+
 def build_poll_embed(state: PollState) -> discord.Embed:
     """투표 현황 임베드 (보기별 인원수 + 투표한 사람 이름, 마감 시 최다 득표 강조)."""
     title = state.title if len(state.title) <= POLL_TITLE_LIMIT else state.title[:POLL_TITLE_LIMIT - 1] + "…"
@@ -1889,11 +2008,15 @@ def build_poll_embed(state: PollState) -> discord.Embed:
         else:
             result = "아무도 투표하지 않았어요."
         description = f"🔒 **투표가 마감됐어요.**\n{result}"
+        if state.capacity > 0:
+            description += f"\n정원 {state.capacity}명 기준으로 확정·대기자를 나눠서 보여 드려요."
     else:
         description = (
             f"{poll_mode_text(state)}\n"
             "보기 버튼을 누르면 바로 반영돼요. 마감하려면 만든 사람이 **🔒 투표 마감** 을 눌러 주세요."
         )
+        if state.capacity > 0:
+            description += f"\n{poll_capacity_text(state)}"
 
     embed = discord.Embed(
         title=f"🗳️ {title}",
@@ -1902,16 +2025,30 @@ def build_poll_embed(state: PollState) -> discord.Embed:
     )
 
     for index, option in enumerate(state.options):
-        name = option if len(option) <= 200 else option[:200] + "…"
+        if state.capacity <= 0:
+            suffix = f" — {state.count(index)}표"
+        else:
+            suffix = f" — {state.confirmed_count(index)}/{state.capacity}"
+            waiting = state.waiting_count(index)
+            if waiting:
+                suffix += f" · 대기 {waiting}"
+        room = 256 - len(suffix) - 4          # 앞의 🏆·말줄임표 자리
+        name = option if len(option) <= room else option[: max(0, room)] + "…"
         if index in winners:
             name = f"🏆 {name}"
         embed.add_field(
-            name=f"{name} — {state.count(index)}표",
-            value=_poll_field_value(state.voter_names(index)),
+            name=f"{name}{suffix}",
+            value=(
+                _poll_field_value(state.voter_names(index))
+                if state.capacity <= 0
+                else _poll_field_value_with_capacity(state, index)
+            ),
             inline=True,
         )
 
     footer = f"투표한 사람 {state.total_voters()}명"
+    if state.capacity > 0:
+        footer += f" · 정원 {state.capacity}명"
     if state.closed:
         footer += " · 마감됨"
     else:
@@ -2080,13 +2217,15 @@ class PollView(discord.ui.View):
     제목="투표 제목 (예: 오늘 내전 몇 시?)",
     보기="쉼표(,)로 구분한 보기 2~20개 (예: 9시, 10시, 11시, 불참)",
     중복선택="여러 보기를 동시에 고를 수 있게 할지 (기본: 예)",
+    정원=f"보기별 확정 인원 (1~{POLL_CAPACITY_MAX}). 먼저 누른 순서대로 확정, 나머지는 대기자 (비우면 제한 없음)",
 )
-@app_commands.rename(제목="제목", 보기="보기", 중복선택="중복선택")
+@app_commands.rename(제목="제목", 보기="보기", 중복선택="중복선택", 정원="정원")
 async def poll_command(
     interaction: discord.Interaction,
     제목: str,
     보기: str,
     중복선택: Optional[bool] = None,
+    정원: Optional[int] = None,
 ) -> None:
     guild = interaction.guild
     if guild is None:
@@ -2098,12 +2237,26 @@ async def poll_command(
     if len(title) > POLL_TITLE_LIMIT:
         raise TeamBotError(f"제목은 **{POLL_TITLE_LIMIT}자** 까지 적을 수 있어요. (지금 {len(title)}자)")
 
+    capacity = 0
+    if 정원 is not None:
+        if 정원 <= 0:
+            raise TeamBotError(
+                f"정원은 **1명 이상**으로 정해 주세요. (지금 {정원})\n"
+                "정원을 비워 두면 인원 제한 없이 투표해요."
+            )
+        if 정원 > POLL_CAPACITY_MAX:
+            raise TeamBotError(
+                f"정원은 최대 **{POLL_CAPACITY_MAX}명** 까지 정할 수 있어요. (지금 {정원}명)"
+            )
+        capacity = int(정원)
+
     options = parse_poll_options(보기)
     state = PollState(
         title=title,
         options=options,
         multi=True if 중복선택 is None else bool(중복선택),
         author_id=interaction.user.id,
+        capacity=capacity,
     )
     view = PollView(state, author_id=interaction.user.id)
     await interaction.response.send_message(embed=build_poll_embed(state), view=view)
@@ -2111,6 +2264,376 @@ async def poll_command(
         view.message = await interaction.original_response()
     except discord.HTTPException:      # 메시지 참조를 못 얻어도 투표는 계속 동작합니다
         LOG.debug("투표 메시지 참조를 가져오지 못했어요")
+
+
+# ---------------------------------------------------------------------------
+# 명단 팀짜기 (음성방 이동 없이 텍스트 명단으로)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RosterPlayer:
+    """명단에 적힌 참가자 한 명 (음성 채널·디스코드 멤버와 무관)."""
+
+    name: str
+    score: int = 0
+    label: str = ""          # 입력한 티어/점수 표기 (예: '1티어', '다이아1', '1200점')
+
+    def line(self) -> str:
+        return f"{self.name} ({self.label})" if self.label else self.name
+
+
+def _canonical_role(token: str) -> Optional[str]:
+    """'플레'·'그마' 같은 약어를 정식 티어 이름으로."""
+    return ROLE_ALIASES.get((token or "").strip().lower())
+
+
+def _role_tier_spec(token: str) -> Optional[tuple[str, int]]:
+    """롤식 티어 토큰 → (표기, 점수). '다이아1' 처럼 붙인 단계 숫자도 반영합니다."""
+    text = (token or "").strip()
+    if not text:
+        return None
+    stage: Optional[int] = None
+    body = text
+    if len(text) >= 2 and text[-1] in "1234" and _canonical_role(text[:-1]):
+        body, stage = text[:-1], int(text[-1])
+    canonical = _canonical_role(body)
+    if canonical is None:
+        return None
+    base = ROLE_TIER_BASE[canonical]
+    if stage is None:
+        return canonical, base
+    return f"{canonical}{stage}", base + ROSTER_STAGE_BONUS[stage]
+
+
+def roster_spec(token: str) -> Optional[tuple[str, int]]:
+    """티어/점수 토큰 하나를 (표기, 밸런스 점수)로 바꿉니다. 아니면 None.
+
+    1티어~5티어(1T·단독 숫자 1~5), 롤식 티어명(아이언~챌린저, 약어 포함),
+    6 이상의 숫자 점수(1200, 1450점)를 알아 봅니다. 1티어가 가장 높은 점수입니다.
+    """
+    text = (token or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+
+    match = re.fullmatch(r"([1-5])\s*(?:티어|티|tier|t)", lowered)
+    if match:
+        tier = int(match.group(1))
+        return f"{tier}티어", ROSTER_TIER_SCORES[tier]
+
+    if lowered.isdigit():
+        value = int(lowered)
+        if 1 <= value <= 5:
+            return f"{value}티어", ROSTER_TIER_SCORES[value]
+        if 6 <= value <= ROSTER_MAX_SCORE:
+            return f"{value}점", value
+        return None
+
+    match = re.fullmatch(r"(\d{1,5})\s*점", lowered)
+    if match:
+        value = int(match.group(1))
+        if 6 <= value <= ROSTER_MAX_SCORE:
+            return f"{value}점", value
+        return None
+
+    return _role_tier_spec(text)
+
+
+def parse_roster_entry(segment: str) -> RosterPlayer:
+    """참가자 한 줄을 이름과 티어/점수로 나눕니다.
+
+    '소현', '소현 1티어', '현수: 플레', '철수 / 다이아1', '영희 - 1200', '민수 1T'
+    처럼 적을 수 있고, 마지막 토막이 티어/점수로 읽힐 때만 이름과 분리합니다.
+    """
+    text = (segment or "").strip().strip("`'\"()[]{}")
+    tokens = [token for token in ROSTER_TOKEN_RE.split(text) if token]
+    if not tokens:
+        raise TeamBotError("빈 항목이 있어요. 참가자 이름을 확인해 주세요.")
+
+    spec: Optional[tuple[str, int]] = None
+    name_tokens = tokens
+
+    if len(tokens) >= 2:
+        spec = roster_spec(tokens[-1])
+        if spec is not None:
+            name_tokens = tokens[:-1]
+        elif len(tokens) >= 3:
+            # '다이아 1' 처럼 띄어 쓴 경우와 '1 티어' 를 앞 토막과 붙여서 확인합니다.
+            spec = roster_spec(f"{tokens[-2]}{tokens[-1]}")
+            if spec is not None:
+                name_tokens = tokens[:-2]
+
+    name = " ".join(name_tokens).strip()
+    if not name:
+        raise TeamBotError(
+            f"`{text}` 에는 이름이 없어요. `이름 티어` 형식으로 적어 주세요. (예: `소현 1티어`)"
+        )
+    if len(name) > ROSTER_NAME_LIMIT:
+        raise TeamBotError(
+            f"이름이 너무 길어요(최대 {ROSTER_NAME_LIMIT}자): `{name[:20]}…`\n"
+            "이름과 티어를 구분자(공백·:·/·-)로 나눠 적어 주세요."
+        )
+    if spec is None:
+        return RosterPlayer(name=name)
+    label, score = spec
+    return RosterPlayer(name=name, score=score, label=label)
+
+
+def parse_roster(raw: str) -> list[RosterPlayer]:
+    """쉼표(`,`, `，`, `、`)나 줄바꿈으로 구분한 명단을 참가자 목록으로."""
+    entries: list[RosterPlayer] = []
+    for segment in ROSTER_SEGMENT_RE.split(raw or ""):
+        if not segment.strip():
+            continue
+        entries.append(parse_roster_entry(segment))
+
+    if len(entries) < ROSTER_MIN_MEMBERS:
+        raise TeamBotError(
+            "참가자를 **2명 이상** 적어 주세요.\n"
+            "예: `/명단팀짜기 명단: 소현 1티어, 현수 2티어, 철수 1200, 영희 플레`"
+        )
+    if len(entries) > ROSTER_MAX_MEMBERS:
+        raise TeamBotError(
+            f"참가자는 최대 **{ROSTER_MAX_MEMBERS}명** 까지 짤 수 있어요. (지금 {len(entries)}명)"
+        )
+    return entries
+
+
+def roster_mode_for(entries: Sequence[RosterPlayer], mode: str) -> str:
+    """자동이면 '티어/점수가 하나라도 있으면 밸런스, 없으면 무작위' 로 정합니다."""
+    if mode != ROSTER_MODE_AUTO:
+        return mode
+    return MODE_BALANCE if any(entry.label for entry in entries) else MODE_RANDOM
+
+
+def roster_players(entries: Sequence[RosterPlayer]) -> list[RosterPlayer]:
+    """티어를 안 적은 사람은 적힌 사람들의 평균 점수로 채워 밸런스를 맞춥니다."""
+    known = [entry.score for entry in entries if entry.label]
+    fallback = int(round(sum(known) / len(known))) if known else DEFAULT_SCORE
+    return [
+        RosterPlayer(name=entry.name, score=entry.score if entry.label else fallback, label=entry.label)
+        for entry in entries
+    ]
+
+
+def split_roster(
+    entries: Sequence[RosterPlayer],
+    mode: str,
+    *,
+    rng: Optional[random.Random] = None,
+) -> tuple[list[RosterPlayer], list[RosterPlayer]]:
+    """명단을 반반으로 나눕니다 (밸런스는 기존 팀 분할 로직을 그대로 사용)."""
+    players = roster_players(entries)
+    if mode == MODE_RANDOM:
+        return random_split(players, rng=rng)
+    return balanced_split(players, rng=rng)
+
+
+def _roster_team_field(team: Sequence[RosterPlayer], limit: int = 1000) -> str:
+    if not team:
+        return "—"
+    lines: list[str] = []
+    used = 0
+    for player in team:
+        line = f"• {player.line()}"
+        if used + len(line) + 1 > limit:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    hidden = len(team) - len(lines)
+    text = "\n".join(lines)
+    if hidden > 0:
+        text += f"\n… 외 {hidden}명"
+    return text
+
+
+def build_roster_embed(
+    team1: Sequence[RosterPlayer],
+    team2: Sequence[RosterPlayer],
+    *,
+    mode: str = MODE_BALANCE,
+    title: str = "🎲 명단 팀짜기 결과",
+    description: str = "",
+) -> discord.Embed:
+    """🔵 1팀 · 🔴 2팀 멤버와 팀별 합계·평균을 보여 주는 임베드."""
+    sum1 = sum(player.score for player in team1)
+    sum2 = sum(player.score for player in team2)
+    avg1 = team_average(team1)
+    avg2 = team_average(team2)
+
+    embed = discord.Embed(
+        title=title,
+        description=description or "명단을 반반으로 나눴어요.",
+        colour=discord.Colour.blurple(),
+    )
+    embed.add_field(
+        name=f"🔵 1팀 · {len(team1)}명 · 합계 {sum1}점 · 평균 {avg1:.0f}점",
+        value=_roster_team_field(team1),
+        inline=True,
+    )
+    embed.add_field(
+        name=f"🔴 2팀 · {len(team2)}명 · 합계 {sum2}점 · 평균 {avg2:.0f}점",
+        value=_roster_team_field(team2),
+        inline=True,
+    )
+    embed.set_footer(
+        text=(
+            f"{ROSTER_MODE_LABELS.get(mode, mode)} 팀짜기 · 총 {len(team1) + len(team2)}명 · "
+            f"팀 합계 차이 {abs(sum1 - sum2)}점"
+        )
+    )
+    return embed
+
+
+def roster_description(mode: str, resolved: str, entries: Sequence[RosterPlayer]) -> str:
+    """결과 임베드 설명 (자동으로 고른 방식도 알려 줍니다)."""
+    typed = sum(1 for entry in entries if entry.label)
+    if resolved == MODE_BALANCE:
+        text = "티어·점수를 반영해 **밸런스**로 반반 나눴어요."
+        if typed and typed < len(entries):
+            text += f"\n티어를 안 적은 {len(entries) - typed}명은 적힌 사람들의 평균 점수로 맞췄어요."
+    else:
+        text = "**무작위**로 반반 나눴어요."
+    if mode == ROSTER_MODE_AUTO:
+        text += f" (방식: 자동 → {MODE_LABELS.get(resolved, resolved)})"
+    return text
+
+
+class RosterView(discord.ui.View):
+    """명단 팀짜기 결과에 붙는 🔀 다시 섞기 버튼."""
+
+    def __init__(
+        self,
+        *,
+        bot_: "TeamBot",
+        author_id: int,
+        entries: Sequence[RosterPlayer],
+        mode: str,
+        resolved_mode: str,
+        timeout: float = BUTTON_TIMEOUT,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.bot = bot_
+        self.author_id = author_id
+        self.entries: list[RosterPlayer] = list(entries)
+        self.mode = mode
+        self.resolved_mode = resolved_mode
+        self.message: Optional[discord.Message] = None
+        self.team1: list[RosterPlayer] = []
+        self.team2: list[RosterPlayer] = []
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions is not None and permissions.move_members:
+            return True
+        await interaction.response.send_message(
+            "명령을 실행한 사람이나 **'멤버 이동'** 권한이 있는 사람만 다시 섞을 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="다시 섞기", emoji="🔀", style=discord.ButtonStyle.primary,
+        custom_id="team_bot:roster:reshuffle",
+    )
+    async def reshuffle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """같은 명단으로 다시 나눕니다 (방식은 처음 고른 그대로)."""
+        try:
+            self.team1, self.team2 = split_roster(self.entries, self.resolved_mode)
+        except TeamBotError as error:
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
+        except Exception:
+            LOG.exception("명단 다시 섞기 처리 중 오류")
+            await interaction.response.send_message(
+                "다시 섞는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.", ephemeral=True
+            )
+            return
+
+        embed = build_roster_embed(
+            self.team1,
+            self.team2,
+            mode=self.resolved_mode,
+            title="🔀 다시 섞은 결과",
+            description=roster_description(self.mode, self.resolved_mode, self.entries),
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.HTTPException:
+            LOG.warning("명단 팀짜기 메시지를 갱신하지 못했어요")
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# /명단팀짜기
+# ---------------------------------------------------------------------------
+
+ROSTER_MODE_CHOICES = [
+    app_commands.Choice(name="자동", value=ROSTER_MODE_AUTO),
+    app_commands.Choice(name="밸런스", value=MODE_BALANCE),
+    app_commands.Choice(name="무작위", value=MODE_RANDOM),
+]
+
+
+@bot.tree.command(
+    name="명단팀짜기",
+    description="음성방 이동 없이, 적어 준 명단만으로 두 팀을 나눠요. (티어·점수 반영)",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    명단="참가자를 쉼표(,)나 줄바꿈으로 구분 (예: 소현 1티어, 현수 2티어, 철수 1200, 영희 플레)",
+    방식="팀 나누는 방식 (기본: 자동 — 티어/점수가 있으면 밸런스, 없으면 무작위)",
+)
+@app_commands.rename(명단="명단", 방식="방식")
+@app_commands.choices(방식=ROSTER_MODE_CHOICES)
+async def roster_command(
+    interaction: discord.Interaction,
+    명단: str,
+    방식: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        raise TeamBotError("서버 안에서만 사용할 수 있는 명령어예요.")
+
+    mode = 방식.value if 방식 is not None else ROSTER_MODE_AUTO
+    entries = parse_roster(명단)
+    resolved = roster_mode_for(entries, mode)
+    team1, team2 = split_roster(entries, resolved)
+
+    description = roster_description(mode, resolved, entries)
+    if resolved == MODE_BALANCE:
+        gap = abs(sum(player.score for player in team1) - sum(player.score for player in team2))
+        description += f"\n팀 점수 합 차이는 **{gap}점** 이에요."
+        if len({entry.score for entry in entries}) == 1:
+            description += "\n(모두 같은 점수라 무작위로 나뉜 결과예요.)"
+    description += "\n마음에 안 들면 아래 **🔀 다시 섞기** 를 눌러 주세요."
+
+    embed = build_roster_embed(team1, team2, mode=resolved, description=description)
+    view = RosterView(
+        bot_=bot,
+        author_id=interaction.user.id,
+        entries=entries,
+        mode=mode,
+        resolved_mode=resolved,
+    )
+    view.team1, view.team2 = team1, team2
+    await interaction.response.send_message(embed=embed, view=view)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:      # 메시지 참조를 못 얻어도 다시 섞기는 동작합니다
+        LOG.debug("명단 팀짜기 메시지 참조를 가져오지 못했어요")
 
 
 # ---------------------------------------------------------------------------

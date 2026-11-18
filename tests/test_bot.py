@@ -399,6 +399,7 @@ class _StubChannel:
 class FakeResponse:
     def __init__(self):
         self.messages = []
+        self.payloads = []
         self.deferred = False
         self.edits = []
 
@@ -407,6 +408,7 @@ class FakeResponse:
 
     async def send_message(self, content=None, **kwargs):
         self.messages.append(content)
+        self.payloads.append(kwargs)
 
     async def edit_message(self, **kwargs):
         self.edits.append(kwargs)
@@ -424,14 +426,18 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, user=None):
+    def __init__(self, user=None, guild=None):
         self.user = user
+        self.guild = guild
         self.response = FakeResponse()
         self.followup = FakeFollowup()
         self.edits = []
 
     async def edit_original_response(self, **kwargs):
         self.edits.append(kwargs)
+
+    async def original_response(self):
+        return None
 
 
 class FakeBot:
@@ -649,7 +655,7 @@ class ViewTests(unittest.TestCase):
 
     def test_commands_registered(self):
         names = {command.name for command in team_bot.bot.tree.get_commands()}
-        for expected in {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표"}:
+        for expected in {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표", "명단팀짜기"}:
             self.assertIn(expected, names)
 
 
@@ -880,7 +886,7 @@ class _SyncGuild:
         self.name = f"서버{guild_id}"
 
 
-EXPECTED_COMMANDS = {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표"}
+EXPECTED_COMMANDS = {"팀나누기", "모이기", "점수설정", "점수초기화", "랭킹", "기록채널", "투표", "명단팀짜기"}
 
 
 class CommandSyncBot:
@@ -943,11 +949,21 @@ class CommandSyncTests(unittest.TestCase):
         self.assertIn("채널", {option["name"] for option in payload_by_name["기록채널"]["options"]})
         self.assertIn("멤버", {option["name"] for option in payload_by_name["점수설정"]["options"]})
         poll_options = {option["name"]: option for option in payload_by_name["투표"]["options"]}
-        self.assertEqual(set(poll_options), {"제목", "보기", "중복선택"})
+        self.assertEqual(set(poll_options), {"제목", "보기", "중복선택", "정원"})
         self.assertTrue(poll_options["제목"]["required"])
         self.assertTrue(poll_options["보기"]["required"])
         self.assertFalse(poll_options["중복선택"]["required"], "중복선택은 기본값이 있는 선택 항목이어야 해요")
         self.assertTrue(poll_options["중복선택"]["description"])
+        self.assertFalse(poll_options["정원"]["required"], "정원은 비워 둘 수 있는 선택 항목이어야 해요")
+        self.assertTrue(poll_options["정원"]["description"])
+        roster_options = {option["name"]: option for option in payload_by_name["명단팀짜기"]["options"]}
+        self.assertEqual(set(roster_options), {"명단", "방식"})
+        self.assertTrue(roster_options["명단"]["required"])
+        self.assertFalse(roster_options["방식"]["required"])
+        self.assertEqual(
+            {choice["name"] for choice in roster_options["방식"]["choices"]},
+            {"자동", "밸런스", "무작위"},
+        )
 
     def test_globals_cleared_once_and_memory_kept_for_later_copy(self):
         asyncio_run(self.bot.sync_commands_to_guilds())
@@ -1266,11 +1282,445 @@ class PollViewTests(unittest.TestCase):
         commands = {command.name: command for command in team_bot.bot.tree.get_commands()}
         self.assertIn("투표", commands)
         parameters = {parameter.name: parameter for parameter in commands["투표"].parameters}
-        self.assertEqual(set(parameters), {"제목", "보기", "중복선택"})
+        self.assertEqual(set(parameters), {"제목", "보기", "중복선택", "정원"})
         self.assertTrue(parameters["제목"].required)
         self.assertTrue(parameters["보기"].required)
         self.assertFalse(parameters["중복선택"].required)
         self.assertIsNone(parameters["중복선택"].default)
+        self.assertFalse(parameters["정원"].required, "정원은 비워 두면 예전처럼 동작해야 해요")
+        self.assertIsNone(parameters["정원"].default)
+
+
+class PollCapacityTests(unittest.TestCase):
+    """선착순 정원과 자동 대기자 승격."""
+
+    def _state(self, capacity=2, multi=True, options=("9시", "10시")):
+        return team_bot.PollState(
+            title="오늘 내전 몇 시?",
+            options=list(options),
+            multi=multi,
+            author_id=1,
+            capacity=capacity,
+        )
+
+    def test_first_capacity_voters_are_confirmed_rest_wait(self):
+        state = self._state(capacity=2)
+        for user_id, name in ((10, "가"), (11, "나"), (12, "다"), (13, "라")):
+            state.toggle(user_id, name, 0)
+
+        self.assertEqual(state.count(0), 4)
+        self.assertEqual(state.confirmed_names(0), ["가", "나"])
+        self.assertEqual(state.waiting_names(0), ["다", "라"])
+        self.assertEqual((state.confirmed_count(0), state.waiting_count(0)), (2, 2))
+        self.assertTrue(state.is_full(0))
+
+    def test_cancel_promotes_first_waiting(self):
+        state = self._state(capacity=2)
+        for user_id, name in ((10, "가"), (11, "나"), (12, "다")):
+            state.toggle(user_id, name, 0)
+        self.assertEqual(state.waiting_names(0), ["다"])
+
+        self.assertFalse(state.toggle(10, "가", 0), "확정 인원이 표를 빼면")
+        self.assertEqual(state.confirmed_names(0), ["나", "다"], "대기 1번이 자동으로 승격돼야 해요")
+        self.assertEqual(state.waiting_names(0), [])
+        self.assertEqual((state.confirmed_count(0), state.waiting_count(0)), (2, 0))
+
+    def test_single_choice_move_promotes_waiting(self):
+        state = self._state(capacity=1, multi=False)
+        state.toggle(10, "가", 0)
+        state.toggle(11, "나", 0)
+        self.assertEqual((state.confirmed_names(0), state.waiting_names(0)), (["가"], ["나"]))
+
+        state.toggle(10, "가", 1)      # 1인 1표 → 다른 보기로 이동
+        self.assertEqual(state.confirmed_names(0), ["나"])
+        self.assertEqual(state.waiting_names(0), [])
+        self.assertEqual(state.confirmed_names(1), ["가"])
+
+    def test_button_label_shows_capacity_and_waiting(self):
+        state = self._state(capacity=2)
+        for user_id, name in ((10, "가"), (11, "나"), (12, "다")):
+            state.toggle(user_id, name, 0)
+        self.assertEqual(team_bot.poll_button_label(state, 0), "9시 (2/2 · 대기 1)")
+        self.assertEqual(team_bot.poll_button_label(state, 1), "10시 (0/2)")
+
+    def test_without_capacity_behaves_as_before(self):
+        state = self._state(capacity=0)
+        for user_id, name in ((10, "가"), (11, "나")):
+            state.toggle(user_id, name, 0)
+        self.assertEqual(state.waiting_names(0), [])
+        self.assertEqual(state.confirmed_count(0), 2)
+        self.assertEqual(team_bot.poll_button_label(state, 0), "9시 (2)")
+        embed = team_bot.build_poll_embed(state)
+        self.assertEqual(embed.fields[0].name, "9시 — 2표")
+        self.assertEqual(embed.fields[0].value, "가, 나")
+        self.assertNotIn("정원", embed.footer.text)
+
+    def test_embed_separates_confirmed_and_waiting(self):
+        state = self._state(capacity=2)
+        for user_id, name in ((10, "가"), (11, "나"), (12, "다")):
+            state.toggle(user_id, name, 0)
+        embed = team_bot.build_poll_embed(state)
+
+        self.assertIn("정원 2명", embed.description)
+        self.assertEqual(embed.fields[0].name, "9시 — 2/2 · 대기 1")
+        self.assertIn("✅ 확정 2/2 — 가, 나", embed.fields[0].value)
+        self.assertIn("⏳ 대기 1 — 1. 다", embed.fields[0].value)
+        self.assertEqual(embed.fields[1].name, "10시 — 0/2")
+        self.assertIn("⏳ 대기 0 — 없음", embed.fields[1].value)
+        self.assertIn("정원 2명", embed.footer.text)
+
+    def test_embed_value_stays_within_limit(self):
+        state = self._state(capacity=10)
+        for index in range(300):
+            state.toggle(1000 + index, f"참가자{index}", 0)
+        embed = team_bot.build_poll_embed(state)
+        self.assertLessEqual(len(embed.fields[0].value), 1024)
+        self.assertIn("외", embed.fields[0].value)
+
+    def test_closed_embed_keeps_capacity_note(self):
+        state = self._state(capacity=1)
+        state.toggle(10, "가", 0)
+        state.toggle(11, "나", 0)
+        state.close()
+        embed = team_bot.build_poll_embed(state)
+        self.assertIn("마감", embed.description)
+        self.assertIn("정원 1명 기준", embed.description)
+        self.assertTrue(embed.fields[0].name.startswith("🏆 9시"))
+
+    def test_view_vote_moves_waiting_into_confirmed(self):
+        state = self._state(capacity=1, multi=False)
+        view = team_bot.PollView(state)
+        가, 나 = FakePollUser(10, "가"), FakePollUser(11, "나")
+
+        asyncio_run(view.handle_vote(FakeInteraction(가), 0))
+        asyncio_run(view.handle_vote(FakeInteraction(나), 0))
+        self.assertEqual(view.children[0].label, "9시 (1/1 · 대기 1)")
+        self.assertEqual(state.waiting_names(0), ["나"])
+
+        asyncio_run(view.handle_vote(FakeInteraction(가), 1))     # 확정 인원이 빠짐
+        self.assertEqual(state.confirmed_names(0), ["나"])
+        self.assertEqual(view.children[0].label, "9시 (1/1)")
+        self.assertEqual(view.children[1].label, "10시 (1/1)")
+
+
+class PollCapacityCommandTests(unittest.TestCase):
+    """`/투표 정원` 파라미터 검증."""
+
+    def _interaction(self):
+        return FakeInteraction(FakePollUser(1, "만든이"), guild=object())
+
+    def _run(self, capacity):
+        interaction = self._interaction()
+        asyncio_run(team_bot.poll_command.callback(interaction, "제목", "9시, 10시", None, capacity))
+        return interaction
+
+    def test_zero_or_negative_capacity_is_rejected_in_korean(self):
+        for value in (0, -1, -10):
+            with self.subTest(value=value):
+                with self.assertRaises(team_bot.TeamBotError) as caught:
+                    self._run(value)
+                self.assertIn("1명 이상", str(caught.exception))
+
+    def test_capacity_over_max_is_rejected(self):
+        with self.assertRaises(team_bot.TeamBotError) as caught:
+            self._run(team_bot.POLL_CAPACITY_MAX + 1)
+        self.assertIn(str(team_bot.POLL_CAPACITY_MAX), str(caught.exception))
+
+    def test_capacity_is_applied_to_poll(self):
+        for value in (1, 10, team_bot.POLL_CAPACITY_MAX):
+            with self.subTest(value=value):
+                interaction = self._run(value)
+                view = interaction.response.payloads[0]["view"]
+                self.assertEqual(view.state.capacity, value)
+                self.assertEqual(view.children[0].label, f"9시 (0/{value})")
+
+    def test_no_capacity_keeps_old_behavior(self):
+        interaction = self._run(None)
+        view = interaction.response.payloads[0]["view"]
+        self.assertEqual(view.state.capacity, 0)
+        self.assertEqual(view.children[0].label, "9시 (0)")
+
+
+class RosterParseTests(unittest.TestCase):
+    """`/명단팀짜기` 명단 파싱 (이름만/티어/롤 티어/점수/혼합)."""
+
+    def test_name_only(self):
+        entries = team_bot.parse_roster("소현, 현수, 철수")
+        self.assertEqual([entry.name for entry in entries], ["소현", "현수", "철수"])
+        self.assertEqual([entry.label for entry in entries], ["", "", ""])
+
+    def test_newline_and_korean_comma_separators(self):
+        entries = team_bot.parse_roster("소현 1티어\n현수 2티어\n철수，영희、민수")
+        self.assertEqual([entry.name for entry in entries], ["소현", "현수", "철수", "영희", "민수"])
+
+    def test_number_tiers_high_to_low(self):
+        entries = team_bot.parse_roster("A 1티어, B 2티어, C 3티어, D 4티어, E 5티어")
+        self.assertEqual([entry.label for entry in entries], ["1티어", "2티어", "3티어", "4티어", "5티어"])
+        scores = [entry.score for entry in entries]
+        self.assertEqual(scores, sorted(scores, reverse=True), "1티어가 가장 높은 점수여야 해요")
+        self.assertEqual(scores, [1500, 1350, 1200, 1000, 850])
+
+    def test_tier_shortcuts_and_bare_numbers(self):
+        entries = team_bot.parse_roster("A 1T, B 2t, C 3티, D 5")
+        self.assertEqual([entry.label for entry in entries], ["1티어", "2티어", "3티어", "5티어"])
+
+    def test_role_tier_names(self):
+        raw = "가 아이언, 나 브론즈, 다 실버, 라 골드, 마 플래티넘, 바 에메랄드, 사 다이아, 아 마스터, 자 그랜드마스터, 차 챌린저"
+        entries = team_bot.parse_roster(raw)
+        self.assertEqual(
+            [entry.label for entry in entries],
+            ["아이언", "브론즈", "실버", "골드", "플래티넘", "에메랄드", "다이아", "마스터", "그랜드마스터", "챌린저"],
+        )
+        scores = [entry.score for entry in entries]
+        self.assertEqual(scores, sorted(scores))
+        self.assertEqual(len(set(scores)), len(scores), "티어마다 점수가 달라야 해요")
+
+    def test_role_tier_abbreviations(self):
+        entries = team_bot.parse_roster("가 브, 나 실, 다 골, 라 플, 마 에, 바 다, 사 마, 아 그마, 자 챌")
+        self.assertEqual(
+            [entry.label for entry in entries],
+            ["브론즈", "실버", "골드", "플래티넘", "에메랄드", "다이아", "마스터", "그랜드마스터", "챌린저"],
+        )
+        scores = [entry.score for entry in entries]
+        self.assertEqual(scores, sorted(scores))
+
+    def test_role_stage_number_adds_points(self):
+        one = team_bot.parse_roster_entry("소현 다이아1")
+        four = team_bot.parse_roster_entry("현수 다이아4")
+        self.assertEqual(one.label, "다이아1")
+        self.assertGreater(one.score, four.score, "다이아1이 다이아4보다 높아야 해요")
+
+    def test_numeric_scores_used_as_is(self):
+        entries = team_bot.parse_roster("A 1200, B 1450점, C 6")
+        self.assertEqual([entry.label for entry in entries], ["1200점", "1450점", "6점"])
+        self.assertEqual([entry.score for entry in entries], [1200, 1450, 6])
+
+    def test_flexible_separators(self):
+        entries = team_bot.parse_roster("소현: 1티어, 현수/플레, 철수 - 1200, 영희 다이아1, 민수 2T")
+        self.assertEqual([entry.name for entry in entries], ["소현", "현수", "철수", "영희", "민수"])
+        self.assertEqual([entry.label for entry in entries], ["1티어", "플래티넘", "1200점", "다이아1", "2티어"])
+
+    def test_name_with_space_is_kept(self):
+        entry = team_bot.parse_roster_entry("김 소현 1티어")
+        self.assertEqual(entry.name, "김 소현")
+        self.assertEqual(entry.label, "1티어")
+
+    def test_too_few_members(self):
+        for raw in ("", "   ", "소현", "소현 1티어"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(team_bot.TeamBotError) as caught:
+                    team_bot.parse_roster(raw)
+                self.assertIn("2명 이상", str(caught.exception))
+
+    def test_too_many_members(self):
+        raw = ", ".join(f"사람{index}" for index in range(team_bot.ROSTER_MAX_MEMBERS + 1))
+        with self.assertRaises(team_bot.TeamBotError) as caught:
+            team_bot.parse_roster(raw)
+        self.assertIn(str(team_bot.ROSTER_MAX_MEMBERS), str(caught.exception))
+
+    def test_tier_only_entry_stays_a_name(self):
+        # 이름 한 글자도 소중하게 남깁니다 (다·마 같은 이름이 티어 약어와도).
+        self.assertEqual(team_bot.parse_roster_entry("다이아 1").name, "다이아")
+        self.assertEqual(team_bot.parse_roster_entry("브론즈").label, "")
+
+    def test_too_long_name(self):
+        with self.assertRaises(team_bot.TeamBotError):
+            team_bot.parse_roster_entry("가" * (team_bot.ROSTER_NAME_LIMIT + 1) + " 1티어")
+
+
+class RosterSplitTests(unittest.TestCase):
+    def test_auto_uses_random_without_tiers(self):
+        entries = team_bot.parse_roster("소현, 현수, 철수, 영희")
+        self.assertEqual(team_bot.roster_mode_for(entries, team_bot.ROSTER_MODE_AUTO), team_bot.MODE_RANDOM)
+
+    def test_auto_uses_balance_with_tiers(self):
+        entries = team_bot.parse_roster("소현 1티어, 현수, 철수, 영희")
+        self.assertEqual(team_bot.roster_mode_for(entries, team_bot.ROSTER_MODE_AUTO), team_bot.MODE_BALANCE)
+
+    def test_explicit_modes_are_kept(self):
+        entries = team_bot.parse_roster("소현, 현수")
+        self.assertEqual(team_bot.roster_mode_for(entries, team_bot.MODE_BALANCE), team_bot.MODE_BALANCE)
+        self.assertEqual(team_bot.roster_mode_for(entries, team_bot.MODE_RANDOM), team_bot.MODE_RANDOM)
+
+    def test_halves_and_keeps_everyone(self):
+        for count in (2, 4, 5, 6, 9):
+            with self.subTest(count=count):
+                entries = team_bot.parse_roster(", ".join(f"사람{index} 1티어" for index in range(count)))
+                team1, team2 = team_bot.split_roster(entries, team_bot.MODE_BALANCE, rng=random.Random(1))
+                self.assertEqual(abs(len(team1) - len(team2)), count % 2)
+                self.assertEqual({player.name for player in team1 + team2}, {f"사람{index}" for index in range(count)})
+
+    def test_top_tiers_are_split_across_teams(self):
+        entries = team_bot.parse_roster("탑1 1티어, 탑2 1티어, 하1 5티어, 하2 5티어")
+        team1, team2 = team_bot.split_roster(entries, team_bot.MODE_BALANCE, rng=random.Random(2))
+        for team in (team1, team2):
+            labels = [player.label for player in team]
+            self.assertEqual(labels.count("1티어"), 1, "1티어끼리 한 팀에 몰리면 안 돼요")
+            self.assertEqual(labels.count("5티어"), 1)
+        self.assertEqual(sum(p.score for p in team1), sum(p.score for p in team2))
+
+    def test_balance_keeps_team_sums_close(self):
+        entries = team_bot.parse_roster(", ".join(f"선수{i} {1200 + i * 37}" for i in range(10)))
+        team1, team2 = team_bot.split_roster(entries, team_bot.MODE_BALANCE, rng=random.Random(3))
+        gap = abs(sum(p.score for p in team1) - sum(p.score for p in team2))
+        self.assertLessEqual(gap, 40)
+
+    def test_untyped_players_get_average_of_typed(self):
+        entries = team_bot.parse_roster("A 1티어, B 3티어, C")
+        players = team_bot.roster_players(entries)
+        self.assertEqual(players[2].score, round((1500 + 1200) / 2))
+        self.assertEqual(players[2].label, "")
+
+    def test_random_split_ignores_scores(self):
+        entries = team_bot.parse_roster("소현 1티어, 현수 1티어, 철수 1티어, 영희 1티어")
+        team1, team2 = team_bot.split_roster(entries, team_bot.MODE_RANDOM)
+        self.assertEqual((len(team1), len(team2)), (2, 2))
+
+
+class RosterEmbedTests(unittest.TestCase):
+    def setUp(self):
+        self.entries = team_bot.parse_roster("소현 1티어, 현수 플레, 철수 1200, 영희")
+        self.team1, self.team2 = team_bot.split_roster(
+            self.entries, team_bot.MODE_BALANCE, rng=random.Random(4)
+        )
+
+    def test_fields_show_teams_and_totals(self):
+        embed = team_bot.build_roster_embed(self.team1, self.team2, mode=team_bot.MODE_BALANCE)
+        self.assertIn("🔵 1팀", embed.fields[0].name)
+        self.assertIn("🔴 2팀", embed.fields[1].name)
+        for field in embed.fields[:2]:
+            self.assertIn("합계", field.name)
+            self.assertIn("평균", field.name)
+        self.assertIn("• 소현 (1티어)", embed.fields[0].value + embed.fields[1].value)
+        self.assertIn("밸런스 팀짜기", embed.footer.text)
+        self.assertIn("팀 합계 차이", embed.footer.text)
+
+    def test_untyped_member_is_shown_without_label(self):
+        embed = team_bot.build_roster_embed(self.team1, self.team2, mode=team_bot.MODE_BALANCE)
+        values = embed.fields[0].value + embed.fields[1].value
+        self.assertIn("• 영희", values)
+        self.assertNotIn("• 영희 (", values)
+
+    def test_long_roster_is_truncated_within_limit(self):
+        entries = team_bot.parse_roster(
+            ", ".join(f"참가선수이름{index:02d}입니다 플래티넘" for index in range(team_bot.ROSTER_MAX_MEMBERS))
+        )
+        team1, team2 = team_bot.split_roster(entries, team_bot.MODE_BALANCE)
+        embed = team_bot.build_roster_embed(team1, team2, mode=team_bot.MODE_BALANCE)
+        for field in embed.fields[:2]:
+            self.assertLessEqual(len(field.value), 1024)
+        self.assertIn("외", embed.fields[0].value + embed.fields[1].value)
+
+    def test_description_mentions_auto_mode(self):
+        description = team_bot.roster_description(team_bot.ROSTER_MODE_AUTO, team_bot.MODE_BALANCE, self.entries)
+        self.assertIn("자동 → 밸런스", description)
+        self.assertIn("평균 점수로 맞췄어요", description)
+
+
+class RosterViewTests(unittest.TestCase):
+    def _view(self, author_id=1):
+        entries = team_bot.parse_roster("소현 1티어, 현수 2티어, 철수 3티어, 영희 4티어, 민수 5티어, 지훈 3티어")
+        view = team_bot.RosterView(
+            bot_=FakeBot(None),
+            author_id=author_id,
+            entries=entries,
+            mode=team_bot.ROSTER_MODE_AUTO,
+            resolved_mode=team_bot.MODE_BALANCE,
+        )
+        view.team1, view.team2 = team_bot.split_roster(entries, team_bot.MODE_BALANCE)
+        return view
+
+    def test_button_layout_and_timeout(self):
+        view = self._view()
+        self.assertEqual([child.custom_id for child in view.children], ["team_bot:roster:reshuffle"])
+        self.assertEqual(view.children[0].label, "다시 섞기")
+        self.assertEqual(view.timeout, team_bot.BUTTON_TIMEOUT)
+
+    def test_reshuffle_keeps_everyone_and_edits_message(self):
+        view = self._view()
+        before = {player.name for player in view.team1 + view.team2}
+        interaction = FakeInteraction(FakePollUser(1, "만든이"))
+
+        asyncio_run(view.reshuffle.callback(interaction))
+
+        self.assertTrue(interaction.response.edits, "다시 섞으면 결과 메시지가 갱신돼야 해요")
+        embed = interaction.response.edits[0]["embed"]
+        self.assertIn("다시 섞은", embed.title)
+        self.assertEqual({player.name for player in view.team1 + view.team2}, before)
+        self.assertEqual(len(view.team1) + len(view.team2), 6)
+
+    def test_permissions(self):
+        view = self._view(author_id=1)
+        author = FakePollUser(1, "만든이")
+        self.assertTrue(asyncio_run(view.interaction_check(FakeInteraction(author))))
+
+        manager = FakePollUser(2, "관리자", move_members=True)
+        self.assertTrue(asyncio_run(view.interaction_check(FakeInteraction(manager))))
+
+        other = FakeInteraction(FakePollUser(3, "나"))
+        self.assertFalse(asyncio_run(view.interaction_check(other)))
+        self.assertIn("다시 섞을 수 있어요", other.response.messages[0])
+
+    def test_timeout_disables_button(self):
+        view = self._view()
+        asyncio_run(view.on_timeout())
+        self.assertTrue(view.children[0].disabled)
+
+
+class RosterCommandTests(unittest.TestCase):
+    def test_command_registered_with_options(self):
+        commands = {command.name: command for command in team_bot.bot.tree.get_commands()}
+        self.assertIn("명단팀짜기", commands)
+        parameters = {parameter.name: parameter for parameter in commands["명단팀짜기"].parameters}
+        self.assertEqual(set(parameters), {"명단", "방식"})
+        self.assertTrue(parameters["명단"].required)
+        self.assertFalse(parameters["방식"].required)
+        self.assertEqual(
+            {choice.name for choice in parameters["방식"].choices},
+            {"자동", "밸런스", "무작위"},
+        )
+
+    def _run(self, raw, mode=None):
+        interaction = FakeInteraction(FakePollUser(1, "만든이"), guild=object())
+        choice = app_commands_choice(mode) if mode else None
+        asyncio_run(team_bot.roster_command.callback(interaction, raw, choice))
+        return interaction
+
+    def test_command_sends_embed_and_view(self):
+        interaction = self._run("소현 1티어, 현수 2티어, 철수 3티어, 영희 4티어")
+        payload = interaction.response.payloads[0]
+        self.assertIn("embed", payload)
+        self.assertIn("view", payload)
+        view = payload["view"]
+        self.assertIsInstance(view, team_bot.RosterView)
+        self.assertEqual(len(view.entries), 4)
+        self.assertIn("🔵 1팀", payload["embed"].fields[0].name)
+
+    def test_auto_mode_without_tiers_is_random(self):
+        interaction = self._run("소현, 현수, 철수, 영희")
+        embed = interaction.response.payloads[0]["embed"]
+        self.assertIn("무작위", embed.description)
+        self.assertIn("무작위 팀짜기", embed.footer.text)
+
+    def test_explicit_balance_mode(self):
+        interaction = self._run("소현, 현수, 철수, 영희", team_bot.MODE_BALANCE)
+        embed = interaction.response.payloads[0]["embed"]
+        self.assertIn("밸런스", embed.description)
+        self.assertIn("모두 같은 점수", embed.description)
+
+    def test_invalid_roster_raises_korean_error(self):
+        with self.assertRaises(team_bot.TeamBotError):
+            self._run("소현")
+
+
+def app_commands_choice(value):
+    """`/명단팀짜기 방식` 에서 디스코드가 넘겨 주는 Choice 객체를 흉내 냅니다."""
+    labels = {
+        team_bot.ROSTER_MODE_AUTO: "자동",
+        team_bot.MODE_BALANCE: "밸런스",
+        team_bot.MODE_RANDOM: "무작위",
+    }
+    return team_bot.app_commands.Choice(name=labels[value], value=value)
 
 
 if __name__ == "__main__":
